@@ -116,6 +116,7 @@ test('package staging pins committed source and rejects dirty or existing output
   assert.equal(revision.source_revision,result.synth_revision);
   const manifest=JSON.parse(await fs.readFile(path.join(output,'package.json'),'utf8'));
   const sourceManifest=JSON.parse(await fs.readFile(path.join(packageRoot,'package.json'),'utf8'));
+  assert.equal(sourceManifest.private,true,'The unassembled source checkout must refuse npm publication');
   assert.equal(manifest.name,'@chimepond/jottune-mcp');assert.equal(manifest.private,false);
   assert.equal(manifest.version,sourceManifest.version);
   assert.deepEqual(manifest.publishConfig,{access:'public',tag:'beta'});

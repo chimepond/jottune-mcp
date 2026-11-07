@@ -60,11 +60,14 @@ export async function stagePackage({synthRoot, output}) {
     }
     const manifest = JSON.parse(await fs.readFile(path.join(packageRoot,'package.json'),'utf8'));
     delete manifest.scripts;
-    await fs.writeFile(path.join(target,'package.json'),JSON.stringify(manifest,null,2)+'\n');
     await copyFiles(sdk,path.join(target,'synth'),files);
     await fs.writeFile(path.join(target,'synth-release.json'),JSON.stringify({
       format:1, source_revision:revision, engine_source:'chimepond/jottune-synth',
     },null,2)+'\n');
+    // The source checkout stays private. Expose a publishable manifest only
+    // after its SDK and source-revision record have been assembled successfully.
+    manifest.private = false;
+    await fs.writeFile(path.join(target,'package.json'),JSON.stringify(manifest,null,2)+'\n');
     return {output:target,synth_revision:revision,synth_files:files.length};
   } catch(error) {
     await fs.rm(target,{recursive:true,force:true});

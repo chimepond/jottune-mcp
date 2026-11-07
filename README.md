@@ -120,10 +120,13 @@ applications, sharing infrastructure, acoustic experiments and test fixtures.
 `synth-release.json` records the bundled source revision. Build the final archive
 from the committed source revision being released so that this citation resolves
 to the corresponding published SDK. Run installation and integration checks on
-the exact archive being published. The source package and staged archive are
-publishable, but no build, test or installation command publishes them. The npm
-publication configuration selects public access and the `beta` distribution tag;
-publication remains an explicit final operation.
+the exact archive being published. The source checkout is `private: true`, so
+publishing directly from it is refused: it does not contain the bundled SDK.
+The explicit packaging script produces a publishable manifest only after the SDK
+and `synth-release.json` have been assembled. No build, test or installation
+command publishes anything. Publish the exact tested `.tgz`, rather than the
+source directory. The npm publication configuration selects public access and the
+`beta` distribution tag; publication remains an explicit final operation.
 
 Code is licensed under Apache-2.0. Bundled synth dependencies retain their
 upstream licences and notices.

@@ -1,7 +1,7 @@
 {
   "name": "@chimepond/jottune-mcp",
   "version": "0.1.0",
-  "private": false,
+  "private": true,
   "description": "Local JotTune Synth composition, rendering and analysis over MCP",
   "license": "Apache-2.0",
   "type": "module",
