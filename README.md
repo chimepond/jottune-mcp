@@ -14,14 +14,17 @@ publish it to npm.
 
 ## Requirements
 
-Use Node.js 22+, Python 3.10+, and a JotTune Synth SDK checkout or a package
-containing one. The native renderer requires Make and a C99 compiler to build.
+For normal setup, use Node.js 24 and Python 3.12 or later. The compatible minimum
+families are Node.js 22 and Python 3.10. A JotTune Synth SDK checkout or a package
+containing one is required. The native renderer needs Make and a C99 compiler.
 An existing compatible renderer can instead be supplied with `--harness`.
 
-The package installation and complete MCP workflow have been checked on macOS
+The package installation and core composition/delivery workflow have been checked on macOS
 with Node 25.8.2/Python 3.14.7 and Linux x86-64 with Node 24.22.1/Python 3.12.3.
-Python 3.10 syntax and the core dependency requirements have been checked;
-executing the declared Node 22/Python 3.10 minimums remains a release gate.
+The Node 22/Python 3.10 families also pass with Node 22.23.4/Python 3.10.22 in
+an isolated Linux x86-64 container. These checks build the bundled renderer,
+discover all 31 tools and exercise composition, revision, rendering, artifact
+delivery, exports and session recovery.
 
 The Node launcher has no npm runtime dependencies. The Python MCP SDK has
 transitive dependencies. NumPy and Matplotlib are optional, explicitly installed
