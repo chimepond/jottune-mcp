@@ -1,7 +1,7 @@
 {
   "name": "@chimepond/jottune-mcp",
-  "version": "0.0.0-development",
-  "private": true,
+  "version": "0.1.0",
+  "private": false,
   "description": "Local JotTune Synth composition, rendering and analysis over MCP",
   "license": "Apache-2.0",
   "type": "module",
@@ -17,5 +17,5 @@
   ],
   "scripts": {"test": "node --test tests/*.test.mjs"},
   "repository": {"type": "git", "url": "git+https://github.com/chimepond/jottune-mcp.git"},
-  "publishConfig": {"access": "public"}
+  "publishConfig": {"access": "public", "tag": "beta"}
 }

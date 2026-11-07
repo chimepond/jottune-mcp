@@ -8,14 +8,20 @@ SVG/PNG visualizations, MIDI/SFZ conversion and portable session recovery.
 Music remains in the workspace you select. No account, hosted model or API key
 is required; the server has no song-publication operation.
 
-The package is development software and has not been released to npm.
-Its intended npm name is `@chimepond/jottune-mcp`.
+Version 0.1.0 is an unpublished public beta candidate for
+`@chimepond/jottune-mcp`. Preparing or installing a local archive does not
+publish it to npm.
 
 ## Requirements
 
 Use Node.js 22+, Python 3.10+, and a JotTune Synth SDK checkout or a package
 containing one. The native renderer requires Make and a C99 compiler to build.
 An existing compatible renderer can instead be supplied with `--harness`.
+
+The package installation and complete MCP workflow have been checked on macOS
+with Node 25.8.2/Python 3.14.7 and Linux x86-64 with Node 24.22.1/Python 3.12.3.
+Python 3.10 syntax and the core dependency requirements have been checked;
+executing the declared Node 22/Python 3.10 minimums remains a release gate.
 
 The Node launcher has no npm runtime dependencies. The Python MCP SDK has
 transitive dependencies. NumPy and Matplotlib are optional, explicitly installed
@@ -108,8 +114,13 @@ npm test
 The staged package contains an exact selected synth source revision, including
 the native build inputs and reusable authoring tools. It excludes song archives,
 applications, sharing infrastructure, acoustic experiments and test fixtures.
-`synth-release.json` records the bundled source revision. Source and staged
-packages retain `private: true`; releasing a version requires an explicit change.
+`synth-release.json` records the bundled source revision. Build the final archive
+from the committed source revision being released so that this citation resolves
+to the corresponding published SDK. Run installation and integration checks on
+the exact archive being published. The source package and staged archive are
+publishable, but no build, test or installation command publishes them. The npm
+publication configuration selects public access and the `beta` distribution tag;
+publication remains an explicit final operation.
 
 Code is licensed under Apache-2.0. Bundled synth dependencies retain their
 upstream licences and notices.

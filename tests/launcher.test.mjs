@@ -115,8 +115,12 @@ test('package staging pins committed source and rejects dirty or existing output
   assert.equal(result.synth_revision,git(['rev-parse','HEAD']));
   assert.equal(revision.source_revision,result.synth_revision);
   const manifest=JSON.parse(await fs.readFile(path.join(output,'package.json'),'utf8'));
-  assert.equal(manifest.name,'@chimepond/jottune-mcp');assert.equal(manifest.private,true);
+  const sourceManifest=JSON.parse(await fs.readFile(path.join(packageRoot,'package.json'),'utf8'));
+  assert.equal(manifest.name,'@chimepond/jottune-mcp');assert.equal(manifest.private,false);
+  assert.equal(manifest.version,sourceManifest.version);
+  assert.deepEqual(manifest.publishConfig,{access:'public',tag:'beta'});
   assert.equal(manifest.scripts,undefined);
+  assert.equal(manifest.dependencies,undefined);
   for(const name of ['server/__pycache__/private.pyc','synth/build/harness','synth/music/song.tl','synth/data/catalog.tsv']) {
     const file=path.join(output,name);await fs.mkdir(path.dirname(file),{recursive:true});
     await fs.writeFile(file,'excluded package member\n');
