@@ -57,6 +57,28 @@ for value in ('', '   ', '/unavailable-jottune-sdk'):
             raise AssertionError('Invalid explicit SDK was accepted')
 `,path.join(packageRoot,'server'),sdk],{cwd:sdk,stdio:['ignore','pipe','pipe']});
 });
+test('the protocol version follows the package manifest and refuses a missing version',async t=>{
+  const {root}=await fixture(t),server=path.join(root,'server');await fs.mkdir(server);
+  await fs.copyFile(path.join(packageRoot,'server/sdk.py'),path.join(server,'sdk.py'));
+  await fs.writeFile(path.join(root,'package.json'),JSON.stringify({version:'1.2.3'}));
+  execFileSync('python3',['-B','-c',`
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sdk import package_version
+manifest = Path(sys.argv[1]).parent / 'package.json'
+assert package_version() == '1.2.3'
+manifest.write_text(json.dumps({'version': '2.0.0-beta.1'}))
+assert package_version() == '2.0.0-beta.1'
+manifest.write_text('{}')
+try:
+    package_version()
+except ValueError:
+    pass
+else:
+    raise AssertionError('A missing package version was accepted')
+`,server],{stdio:['ignore','pipe','pipe']});
+});
 test('a bundled SDK takes priority over a sibling checkout',async t=>{
   const {root,sdk}=await fixture(t),packageDirectory=path.join(root,'jottune-mcp');
   await fs.mkdir(packageDirectory);

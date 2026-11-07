@@ -62,6 +62,8 @@ async def retrieve(client, locator, *, text=False):
 async def check(spec, workspace, harness, launcher, env):
     async with Client(spec, mode="legacy", cache=None, read_timeout_seconds=120) as client:
         assert client.server_info.name == "jottune-mcp"
+        expected_version = json.loads(launcher.resolve().parents[1].joinpath("package.json").read_text())["version"]
+        assert client.server_info.version == expected_version
         inventory = await client.list_tools()
         assert {tool.name for tool in inventory.tools} == TOOLS
         assert all(tool.input_schema.get("additionalProperties") is False for tool in inventory.tools)

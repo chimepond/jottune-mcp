@@ -4,11 +4,20 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
 
 REQUIRED = ("Makefile", "tools/fm.py", "tools/interchange.py", "docs/INSTRUMENT.md", "src/host/harness.c")
+
+
+def package_version():
+    manifest = Path(__file__).resolve().parents[1] / "package.json"
+    version = json.loads(manifest.read_text(encoding="utf8")).get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("The JotTune MCP package manifest needs a version.")
+    return version
 
 
 def resolve_sdk(explicit=None):

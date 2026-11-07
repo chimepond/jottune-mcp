@@ -42,6 +42,21 @@ Copy the printed configuration into your MCP client. It contains absolute
 launcher, SDK, Python and workspace paths. Configuration generation does not
 edit client files. Reconnect the client after changing its configuration.
 
+For an installed npm package, use the `jottune-mcp` command from that
+installation instead of `node bin/jottune-mcp.mjs`. Keep the Python virtual
+environment outside the installed package and locate its requirements through
+the command, rather than assuming a source-checkout layout:
+
+```sh
+"$JOTTUNE_PYTHON" -m pip install -r "$(jottune-mcp requirements)"
+jottune-mcp build
+jottune-mcp doctor --workspace session
+jottune-mcp config --workspace session
+```
+
+The explicit build writes into the selected SDK, so that directory must be
+writable. A separately built renderer can instead be selected with `--harness`.
+
 `--workspace` resolves relative tool paths and does not restrict the account's
 filesystem permissions. The server needs access to files involved in the session.
 

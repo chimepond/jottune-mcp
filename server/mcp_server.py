@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any, Literal, get_type_hints
 
-from sdk import operations
+from sdk import operations, package_version
 
 
 def interchange_reply(value, detail):
@@ -132,7 +132,7 @@ def create_server(harness=None, *, synth_root=None):
             return result
 
     server = StrictServer(
-        "jottune-mcp", title="JotTune MCP", version="0.0.0-development", subscriptions=False, log_level="WARNING",
+        "jottune-mcp", title="JotTune MCP", version=package_version(), subscriptions=False, log_level="WARNING",
         instructions="Start with reference() for the instrument in bounded text pages. "
         "reference(source='reference-options') describes each source's selectors, copyable requests and declared reference costs without native work. "
         "Use reference(section='index') to discover guide topics and reference(source='params', section='send') for native fields. "
