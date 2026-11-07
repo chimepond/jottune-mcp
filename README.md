@@ -38,6 +38,7 @@ a sibling checkout. The engine and authoring helpers are maintained in
 `jottune-synth`; this repository maintains only the MCP transport and launcher.
 
 ```sh
+python3 -c 'import sys; assert sys.version_info >= (3, 10), "Use Python 3.10 or later"'
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements/core.txt
 export JOTTUNE_PYTHON="$PWD/.venv/bin/python"
@@ -46,6 +47,12 @@ mkdir -p session
 node bin/jottune-mcp.mjs doctor --workspace session
 node bin/jottune-mcp.mjs config --workspace session
 ```
+
+Copy the printed configuration into your MCP client's local stdio-server settings.
+Configuration layouts differ by client; this prints the conventional mcpServers
+entry, not a claim that every client accepts that file format unchanged. The
+protocol workflow is tested through the Python MCP client; individual desktop
+clients require their own configuration and acceptance check.
 
 Copy the printed configuration into your MCP client. It contains absolute
 launcher, SDK, Python and workspace paths. Configuration generation does not
@@ -57,7 +64,11 @@ environment outside the installed package and locate its requirements through
 the command, rather than assuming a source-checkout layout:
 
 ```sh
+python3 -c 'import sys; assert sys.version_info >= (3, 10), "Use Python 3.10 or later"'
+python3 -m venv ~/.local/share/jottune-mcp/venv
+export JOTTUNE_PYTHON="$HOME/.local/share/jottune-mcp/venv/bin/python"
 "$JOTTUNE_PYTHON" -m pip install -r "$(jottune-mcp requirements)"
+mkdir -p session
 jottune-mcp build
 jottune-mcp doctor --workspace session
 jottune-mcp config --workspace session
@@ -65,9 +76,24 @@ jottune-mcp config --workspace session
 
 The explicit build writes into the selected SDK, so that directory must be
 writable. A separately built renderer can instead be selected with `--harness`.
+Reinstalling or updating the npm package replaces its bundled SDK and removes
+that local build; run `jottune-mcp build` and `doctor` again before reconnecting.
+A separately managed SDK/harness stays under your control.
 
-`--workspace` resolves relative tool paths and does not restrict the account's
-filesystem permissions. The server needs access to files involved in the session.
+`--workspace` is the boundary for tool-selected inputs, outputs and artifact
+reads, including resolved symlink targets. Copy files into that directory before
+importing or exporting them. Analysis and catalog outputs require new paths and
+never replace existing files. The configured SDK and native executable remain
+explicit trusted startup inputs outside that directory.
+
+This is a path boundary, not an operating-system sandbox against concurrent
+changes by other processes with the same account permissions. Tools run in
+separate children with a 120-second execution limit and bounded output capture;
+cancellation, input EOF and normal termination stop their native descendants.
+MCP native rendering uses the same 192 MiB render/256 MiB memory profile as the
+browser. A timeout can leave an incomplete receipt or already completed output;
+inspect retained logs before retrying. Default replies are compact, parameter
+reads are paged, and binary artifact reads accept up to 65536 bytes per page.
 
 ## Discover and compose
 
@@ -111,6 +137,7 @@ mkdir -p dist
 node scripts/package.mjs --synth-root ../jottune-synth --output dist/package
 npm pack ./dist/package --ignore-scripts --pack-destination dist
 npm test
+.venv/bin/python tests/security.py
 .venv/bin/python tests/integration.py --synth-root ../jottune-synth
 ```
 
@@ -129,4 +156,10 @@ source directory. The npm publication configuration selects public access and th
 `beta` distribution tag; publication remains an explicit final operation.
 
 Code is licensed under Apache-2.0. Bundled synth dependencies retain their
-upstream licences and notices.
+upstream licences and notices, including the synth NOTICE for adapted tables.
+For security reports, rights questions or takedown requests, see SECURITY.md.
+
+The prepared GitHub workflow checks the launcher on Linux and macOS. Its native
+integration job requires repository variable `JOTTUNE_SYNTH_REF` set to the full
+public SDK commit ID. That job is skipped until configured; launcher checks alone
+do not establish SDK integration. Hosted CI has not been run for this candidate.

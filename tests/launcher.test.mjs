@@ -95,7 +95,7 @@ test('client configuration freezes the selected SDK and workspace paths',async t
   const {root,sdk}=await fixture(t),workspace=path.join(root,'session');await fs.mkdir(workspace);
   const value=JSON.parse(run(['config','--synth-root',sdk,'--workspace',workspace],{JOTTUNE_PYTHON:process.execPath}));
   const entry=value.mcpServers.jottune;
-  assert.equal(entry.command,process.execPath);
+  assert.equal(await fs.realpath(entry.command),await fs.realpath(process.execPath));
   assert.deepEqual(entry.args,[launcher,'serve','--synth-root',sdk,'--harness',path.join(sdk,'build/s12e10p1v1/harness'),'--workspace',workspace]);
 });
 test('package selection excludes corpora, apps, infrastructure and experiments',()=>{

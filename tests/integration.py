@@ -38,6 +38,7 @@ async def call(client, name, arguments, *, ok=True):
     reply = await client.call_tool(name, arguments)
     value = reply.structured_content
     assert isinstance(value, dict) and value.get("ok") is ok, (name, value)
+    assert bool(reply.is_error) is (not ok), (name, reply.is_error)
     return value
 
 
@@ -67,6 +68,33 @@ async def check(spec, workspace, harness, launcher, env):
         inventory = await client.list_tools()
         assert {tool.name for tool in inventory.tools} == TOOLS
         assert all(tool.input_schema.get("additionalProperties") is False for tool in inventory.tools)
+        assert all("oneOf" not in tool.input_schema for tool in inventory.tools)
+        assert len(json.dumps([tool.model_dump() for tool in inventory.tools])) < 65536
+        assert all(tool.title for tool in inventory.tools)
+        with tempfile.TemporaryDirectory(prefix="jottune-outside-") as outside:
+            private = Path(outside) / "private.tl"
+            private.write_text("PRIVATE_SENTINEL=not-a-song\n")
+            (workspace / "linked.tl").symlink_to(private)
+            (workspace / "linked-dir").symlink_to(outside, target_is_directory=True)
+            for tool, arguments in [
+                ("describe", {"source": str(private)}),
+                ("describe", {"source": "linked.tl"}),
+                ("compare", {"a": str(private), "b": "bell"}),
+                ("gen_events", {"files": [str(private)]}),
+                ("artifact_read", {"directory": outside, "kind": "record", "filename": "private.tl", "digest": hashlib.sha256(private.read_bytes()).hexdigest()}),
+                ("artifact_read", {"directory": ".", "kind": "record", "filename": "linked.tl", "digest": hashlib.sha256(private.read_bytes()).hexdigest()}),
+                ("catalog_build", {"out": str(private), "records": []}),
+                ("analyze", {"wav": str(private), "mode": "spectro", "out": "plot.png"}),
+                ("midi_import", {"source": "song.mid", "options": ["--tuning", str(private)]}),
+            ]:
+                refused = await call(client, tool, arguments, ok=False)
+                assert "PRIVATE_SENTINEL" not in json.dumps(refused)
+            assert private.read_text() == "PRIVATE_SENTINEL=not-a-song\n"
+            (workspace / "linked.tl").unlink()
+            (workspace / "linked-dir").unlink()
+        parameters = await call(client, "params", {})
+        assert parameters["next_offset"] is not None and len(json.dumps(parameters)) < 16384
+        await call(client, "artifact_read", {"directory": ".", "kind": "wav", "digest": "a" * 64, "length": 65537}, ok=False)
         guide = await call(client, "reference", {"section": "Musical-time scores", "length": 8192})
         score = json.loads(re.search(r"```json\s*(.*?)\s*```", guide["text"], re.S).group(1))
         score["name"] = "MCP integration"

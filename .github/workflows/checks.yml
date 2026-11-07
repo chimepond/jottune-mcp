@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Nenad Micic
+# SPDX-License-Identifier: Apache-2.0
+name: MCP checks
+'on': [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  launcher:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check local launcher and workspace refusals
+        run: |
+          node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)'
+          node --version
+          python3 --version
+          npm test
+          python3 -B tests/security.py WorkspaceTests.test_paths_and_link_targets_are_confined_before_reading WorkspaceTests.test_existing_analysis_and_catalog_outputs_are_refused
+  integration:
+    if: vars.JOTTUNE_SYNTH_REF != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SDK_SHA: ${{ vars.JOTTUNE_SYNTH_REF }}
+    steps:
+      - name: Require a pinned public SDK commit
+        shell: bash
+        run: |
+          [[ "$SDK_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'JOTTUNE_SYNTH_REF must be a full lowercase public commit ID.' >&2; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: jottune-mcp
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: chimepond/jottune-synth
+          ref: ${{ env.SDK_SHA }}
+          path: jottune-synth
+          persist-credentials: false
+      - name: Build and exercise the selected SDK
+        run: |
+          test "$(git -C jottune-synth rev-parse HEAD)" = "$SDK_SHA"
+          make -C jottune-synth -j2 all
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r jottune-mcp/requirements/core.txt
+          .venv/bin/python -B jottune-mcp/tests/security.py
+          .venv/bin/python -B jottune-mcp/tests/integration.py --synth-root jottune-synth

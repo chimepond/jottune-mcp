@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawnSync} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {packageRoot, resolveSDK} from '../lib/sdk.mjs';
 
 const launcher = fileURLToPath(import.meta.url);
@@ -37,7 +37,8 @@ const installFor = file => [python, '-m', 'pip', 'install', '-r', file];
 function run(executable, arguments_, options = {}) {
   const result = spawnSync(executable, arguments_, {stdio: 'inherit',
     env: {...process.env, JOTTUNE_SYNTH_ROOT: root}, ...options});
-  if (result.error) fail(result.error.message);
+  if (result.error) fail(executable === 'make' && result.error.code === 'ENOENT'
+    ? 'Make is unavailable. Install Make and a C99 compiler, then run jottune-mcp build again.' : result.error.message);
   process.exit(result.status ?? 1);
 }
 function checkWorkspace() {
@@ -45,6 +46,15 @@ function checkWorkspace() {
     if (!fs.statSync(workspace).isDirectory()) throw Error('not a directory');
     fs.accessSync(workspace, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
   } catch (error) { fail('Choose an existing readable/writable --workspace directory: ' + error.message); }
+}
+function nodePath() {
+  // Prefer a persistent PATH alias over a resolved version-specific executable.
+  const executable = fs.realpathSync(process.execPath);
+  for (const directory of (process.env.PATH || '').split(path.delimiter)) {
+    const candidate = path.resolve(directory, 'node');
+    try { if (candidate !== executable && fs.realpathSync(candidate) === executable) return candidate; } catch {}
+  }
+  return process.execPath;
 }
 function pythonPath() {
   const candidates = python.includes('/') ? [path.resolve(python)] :
@@ -71,7 +81,8 @@ Set JOTTUNE_PYTHON to that venv's executable. build explicitly requires Make
 and a C99 compiler; --harness or JOTTUNE_HARNESS selects an existing renderer.
 config prints a local MCP client configuration; it does not edit client files.
 --workspace chooses an existing session directory (default: current directory).
-Relative tool paths resolve there; it is not a filesystem security boundary.
+Tool-selected paths stay inside that workspace, including symlink targets.
+Move files into it explicitly before composing, importing or exporting.
 Installation never downloads or compiles an engine. No command publishes music.`);
 } else {
   if ((hasHarness || hasWorkspace) && !['serve', 'doctor', 'config', 'svg', 'interchange'].includes(command))
@@ -90,7 +101,7 @@ Installation never downloads or compiles an engine. No command publishes music.`
     if (args.length) fail('Unknown config arguments: ' + args.join(' '));
     checkWorkspace();
     console.log(JSON.stringify({mcpServers: {jottune: {
-      command: process.execPath,
+      command: nodePath(),
       args: [launcher, 'serve', '--synth-root', root, '--harness', harness, '--workspace', workspace],
       env: {JOTTUNE_PYTHON: pythonPath()},
     }}}, null, 2));
@@ -145,7 +156,18 @@ print(json.dumps({'version': sys.version.split()[0], 'supported': sys.version_in
     checkWorkspace();
     if (!fs.existsSync(harness)) fail('Native harness is missing. Run jottune-mcp build or supply --harness PATH.');
     if (command === 'svg') run(process.execPath, [path.join(root, 'tools/tl_svg.mjs'), ...args, '--harness', harness], {cwd: workspace});
-    run(pythonPath(), ['-B', path.join(packageRoot, 'server/mcp_server.py'), '--synth-root', root,
-      '--harness', harness], {cwd: workspace});
+    const child = spawn(pythonPath(), ['-B', path.join(packageRoot, 'server/mcp_server.py'), '--synth-root', root,
+      '--harness', harness], {cwd: workspace, stdio:['pipe','pipe','inherit'], env:{...process.env, JOTTUNE_SYNTH_ROOT:root}});
+    process.stdin.pipe(child.stdin);
+    child.stdout.pipe(process.stdout);
+    child.stdin.on('error',error=>{ if (error.code !== 'EPIPE') console.error(error.message); });
+    for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{
+      process.stdin.unpipe(child.stdin);
+      child.stdin.end();
+      process.stdin.destroy();
+      child.kill(signal);
+    });
+    child.on('error',error=>fail(error.message));
+    child.on('exit',(code,signal)=>{process.exitCode=code ?? (signal==='SIGINT'?130:143);});
   } else fail('Unknown command: ' + command);
 }

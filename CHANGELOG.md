@@ -2,6 +2,9 @@
 
 ## 0.1.0 — unpublished beta candidate
 
+- Confine MCP tool paths to the workspace and refuse destructive output reuse.
+- Isolate and bound tool execution; cancel and reap native descendants.
+- Bound default replies and use interoperable object-root tool schemas.
 - Guard the source checkout against publishing without its assembled synth SDK.
 - Provide the JotTune stdio MCP tool surface and local Node launcher.
 - Resolve an explicit, bundled or sibling synth SDK without a separate engine fork.

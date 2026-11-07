@@ -9,7 +9,7 @@ import {fileURLToPath} from 'node:url';
 import {packageRoot, resolveSDK} from '../lib/sdk.mjs';
 
 const sdkFiles = new Set([
-  'LICENSE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md',
+  'LICENSE', 'NOTICE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md',
   'tools/fm.py', 'tools/score.py', 'tools/generator.py', 'tools/measure.py',
   'tools/midi_export.py', 'tools/sample_export.py', 'tools/interchange.py',
   'tools/export_schema.py',
@@ -52,7 +52,7 @@ export async function stagePackage({synthRoot, output}) {
   const files = git(['ls-files','-z']).split('\0').filter(name => name && isSDKFile(name));
   await fs.mkdir(target,{recursive:false});
   try {
-    for (const member of ['LICENSE','README.md','CHANGELOG.md','bin','lib','server','requirements']) {
+    for (const member of ['LICENSE','SECURITY.md','README.md','CHANGELOG.md','bin','lib','server','requirements']) {
       const input = path.join(packageRoot,member), info = await fs.lstat(input);
       if (info.isSymbolicLink())throw Error('Package source must not contain links.');
       await fs.cp(input,path.join(target,member),{recursive:true,filter:file=>

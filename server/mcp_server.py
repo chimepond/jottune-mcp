@@ -5,6 +5,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
+import signal
+import subprocess
+import tempfile
 import copy
 import inspect
 import json
@@ -13,6 +18,93 @@ import sys
 from typing import Any, Literal, get_type_hints
 
 from sdk import operations, package_version
+from guard import Workspace, WorkspaceError
+
+TOOL_SECONDS = 120
+CAPTURE_BYTES = 4 * 1024 * 1024
+ACTIVE_CHILDREN = set()
+
+
+def kill_operation(pid):
+    # Some bounded native adapters own nested process groups. Stop those too,
+    # before the operation parent disappears and its descendants are reparented.
+    groups = {pid}
+    try:
+        rows = subprocess.check_output(["ps", "-axo", "pid=,ppid=,pgid="], timeout=1, text=True)
+        process_rows = [tuple(map(int, row.split())) for row in rows.splitlines()]
+        descendants = {pid}
+        for _ in range(len(process_rows)):
+            added = {child for child, parent, group in process_rows if parent in descendants} - descendants
+            if not added:
+                break
+            descendants.update(added)
+        groups.update(group for child, parent, group in process_rows if child in descendants)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    for group in sorted(groups - {pid}):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def stop_children(signum=None, frame=None):
+    for pid in tuple(ACTIVE_CHILDREN):
+        kill_operation(pid)
+    if signum is not None:
+        raise SystemExit(128 + signum)
+
+
+async def isolated_tool(name, arguments, harness, synth_root, workspace):
+    """Keep cancellation responsive and reap the complete operation process group."""
+    command = [sys.executable, "-B", str(Path(__file__).resolve()), "--tool-worker",
+               "--synth-root", str(synth_root)]
+    if harness is not None:
+        command += ["--harness", str(harness)]
+    operation_temp = tempfile.TemporaryDirectory(prefix=".jottune-operation-", dir=workspace)
+    child = await asyncio.create_subprocess_exec(*command, cwd=workspace,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True, env={**os.environ, "JOTTUNE_MCP_WORKSPACE": str(workspace), "TMPDIR": operation_temp.name})
+    ACTIVE_CHILDREN.add(child.pid)
+
+    async def read(stream, limit):
+        chunks, size = [], 0
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("Tool output exceeds its capture limit; use compact or paged output.")
+            chunks.append(chunk)
+
+    async def execute():
+        child.stdin.write(json.dumps({"name": name, "arguments": arguments}, allow_nan=False).encode())
+        await child.stdin.drain()
+        child.stdin.close()
+        stdout, _ = await asyncio.gather(read(child.stdout, CAPTURE_BYTES), read(child.stderr, 65536))
+        await child.wait()
+        value = json.loads(stdout)
+        if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+            raise ValueError("Tool returned no valid structured outcome.")
+        return value
+
+    try:
+        return await asyncio.wait_for(execute(), TOOL_SECONDS)
+    except asyncio.TimeoutError:
+        return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool exceeded the 120-second execution limit; inspect retained logs before retrying.")
+    except (OSError, ValueError, UnicodeError):
+        return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool failed or exceeded its output budget; inspect retained logs and use compact or paged output.")
+    finally:
+        kill_operation(child.pid)
+        await asyncio.shield(child.wait())
+        ACTIVE_CHILDREN.discard(child.pid)
+        operation_temp.cleanup()
+
 
 
 def interchange_reply(value, detail):
@@ -71,12 +163,39 @@ def interchange_reply(value, detail):
 def create_server(harness=None, *, synth_root=None):
     fm, interchange = operations(synth_root)
     from mcp.server import MCPServer
-    from mcp.types import CallToolResult, TextContent
+    from mcp.types import CallToolResult, TextContent, ToolAnnotations
     from pydantic import TypeAdapter, ValidationError
 
-    argument_specs = {}
+    argument_specs, operation_functions = {}, {}
+    workspace = Workspace(Path.cwd())
 
     class StrictServer(MCPServer):
+        async def run_stdio_async(self):
+            import anyio
+            from mcp.server.stdio import stdio_server
+            class ClosingReader:
+                def __init__(self, stream): self.stream = stream
+                def __getattr__(self, name): return getattr(self.stream, name)
+                def __aiter__(self): return self
+                async def __anext__(self):
+                    try:
+                        return await self.receive()
+                    except anyio.EndOfStream:
+                        raise StopAsyncIteration
+                async def __aenter__(self):
+                    await self.stream.__aenter__()
+                    return self
+                async def __aexit__(self, *args): return await self.stream.__aexit__(*args)
+                async def receive(self):
+                    try:
+                        return await self.stream.receive()
+                    except anyio.EndOfStream:
+                        stop_children()
+                        raise
+            async with stdio_server() as (reader, writer):
+                await self._lowlevel_server.run(ClosingReader(reader), writer,
+                    self._lowlevel_server.create_initialization_options())
+
         async def call_tool(self, name, arguments, context=None):
             # This public dispatch hook runs after protocol/handshake validation
             # but before SDK argument coercion. Missing required bindings keep
@@ -96,7 +215,16 @@ def create_server(harness=None, *, synth_root=None):
                     if message is not None:
                         reply = dict(version=1, ok=False, exit=2, message=message)
                         return CallToolResult(content=[TextContent(type="text", text=json.dumps(reply))],
-                                              structured_content=reply)
+                                              structured_content=reply, is_error=True)
+                    try:
+                        workspace.validate(name, arguments)
+                    except (WorkspaceError, OSError, ValueError):
+                        reply = dict(version=1, ok=False, exit=2,
+                            message="Tool paths must remain inside the workspace and outputs must use new paths.")
+                    else:
+                        reply = await isolated_tool(name, arguments, harness, fm.ROOT, workspace.root)
+                    return CallToolResult(content=[TextContent(type="text", text=json.dumps(reply))],
+                        structured_content=reply, is_error=not reply.get("ok", False))
             return await super().call_tool(name, arguments, context)
 
         async def list_tools(self):
@@ -107,7 +235,7 @@ def create_server(harness=None, *, synth_root=None):
                 if tool.name == "interchange_export":
                     tool.input_schema["properties"]["midi_format"]["enum"] = [0, 1]
                 if tool.name == "compose":
-                    tool.input_schema["properties"]["score"] = {"anyOf": [fm.score_module().score_schema(), {"type": "null"}]}
+                    tool.input_schema["properties"]["score"] = {"anyOf": [{"type": "object"}, {"type": "null"}]}
                 if tool.name in ("measure_sections", "measure_voice_sections"):
                     endpoint = {"type": "integer", "minimum": 0, "maximum": 2 ** 64 - 1}
                     tool.input_schema["properties"]["sections"] = {"type": "array", "minItems": 1,
@@ -126,9 +254,9 @@ def create_server(harness=None, *, synth_root=None):
                             "filename": {"type": "string", "pattern": "^[0-9a-f]{64}\\.json$"}},
                         "required": ["directory", "kind", "digest", "filename"], "additionalProperties": False},
                         {"type": "null"}]}
-                    tool.input_schema["oneOf"] = [
-                        {"required": ["score"], "properties": {"score": {"type": "object"}, "source_ref": {"type": "null"}}},
-                        {"required": ["source_ref"], "properties": {"score": {"type": "null"}, "source_ref": {"type": "object"}}}]
+                    # Cross-field exclusivity is checked by the operation. Keep
+                    # the root an ordinary object for MCP clients with stricter schemas.
+                    tool.input_schema.pop("oneOf", None)
             return result
 
     server = StrictServer(
@@ -143,11 +271,11 @@ def create_server(harness=None, *, synth_root=None):
         "score_inspect shows authored sections/voices and gate advisories; score_revise previews one identity-checked replacement. "
         "Use their retained source_ref in compose to validate and publish the revision. "
         "measure_section measures final output after a complete render including prior effects history; it uses a full temporary WAV. "
-        "measure_sections batches up to32 ordered windows with the same full history and two render passes through a pipe, without an audio file. "
+        "measure_sections batches up to 32 ordered windows with the same full history and two render passes through a pipe, without an audio file. "
         "gen_events inspects the native generated-note schedule without PCM; optional receipts retain its complete output for retrieval. "
         "Operations have no current patch or session; supply timeline text or input paths and explicit output paths. "
         "Check exit and measured checks separately. Use explicit detail='compact' on render/check_patch for long scores; "
-        "legacy full remains their default. Compact render supplies a verified record reader; "
+        "compact is their default. Compact render supplies a verified record reader; "
         "receipt_dir retains complete validation outcomes without rerendering. describe/compare default to compact; "
         "page detail retrieves omitted full-result data with a stable result SHA256; windows selects existing spatial windows. "
         "Opt into receipt_dir to retain requests, outcomes and complete measured/search results without recomputing. "
@@ -168,17 +296,21 @@ def create_server(harness=None, *, synth_root=None):
             {name: TypeAdapter(hints[name]) for name in signature.parameters},
             {name for name, param in signature.parameters.items() if param.default is inspect.Parameter.empty},
         )
-        return server.tool()(fn)
+        operation_functions[fn.__name__] = fn
+        readonly = fn.__name__ in {"params", "reference", "load_patch", "artifact_read", "session_verify", "interchange_verify"}
+        return server.tool(title=fn.__name__.replace("_", " ").title(),
+            annotations=ToolAnnotations(read_only_hint=readonly, destructive_hint=False,
+                idempotent_hint=readonly, open_world_hint=False))(fn)
 
     @tool
-    def params() -> dict[str, Any]:
-        """Return the full native inventory; restricted clients should use bounded reference(source='params') instead."""
-        return fm.params(harness=harness)
+    def params(offset: int = 0, length: int = 4096) -> dict[str, Any]:
+        """Read a bounded native-parameter page; follow next_offset or use reference for topic selection."""
+        return fm.reference(source="params", section="all", offset=offset, length=length, harness=harness)
 
     @tool
     def reference(source: Literal["instrument", "params", "gen-params", "recipes", "midi-options", "transcribe-options", "reference-options"] = "instrument",
                   section: str | None = None, offset: int = 0, length: int = 4096) -> dict[str, Any]:
-        """Read bounded source text. reference-options supplies JSON selector examples and declared reference costs without native work. section=index lists guide/native topics; all reads the whole source. Recipes support index/all only; use load_patch(name) for one recipe. midi-options/transcribe-options/reference-options support all only. Follow next_offset; length1..8192 UTF-8 bytes. Compare source/selection hashes across pages; they are not input guards."""
+        """Read bounded source text. reference-options supplies JSON selector examples and declared reference costs without native work. section=index lists guide/native topics; all reads the whole source. Recipes support index/all only; use load_patch(name) for one recipe. midi-options/transcribe-options/reference-options support all only. Follow next_offset; length 1..8192 UTF-8 bytes. Compare source/selection hashes across pages; they are not input guards."""
         return fm.reference(source=source, section=section, offset=offset, length=length, harness=harness)
 
     @tool
@@ -189,7 +321,7 @@ def create_server(harness=None, *, synth_root=None):
                    start_ns: int | None = None, end_ns: int | None = None,
                    receipt_dir: str | None = None, receipt_parent: str | None = None,
                    receipt_purpose: str = "") -> dict[str, Any]:
-        """Inspect actual native generated events from exactly one of ordered files or complete text. No PCM/WAV/take publication. At most17 regular-file occurrences/4MiB inputs; no recipe expansion. Every call normally runs two discovery children and one manifest child; raw pages re-execute. Follow next_offset with expected_manifest_sha256, assemble UTF8 to EOF and verify the manifest hash. Prefer receipt_dir for long output: full_result_sha256 identifies complete JSON retrievable with artifact_read(kind='receipt') without native work, then decode its manifest stdout. Public15360-byte bound differs from the duplicated SDK envelope. summary reports ON/OFF counts and ON-only pitch/velocity ranges for observed lanes, optionally in a half-open nanosecond interval; summary requires offset0/length4096, page requires bounds absent. It still computes the whole schedule. Empty selections do not establish generator inactivity or audibility. Read reference(section='Session generators and live lanes') for timing and capture limits."""
+        """Inspect actual native generated events from exactly one of ordered files or complete text. No PCM/WAV/take publication. At most 17 regular-file occurrences/4MiB inputs; no recipe expansion. Every call normally runs two discovery children and one manifest child; raw pages re-execute. Follow next_offset with expected_manifest_sha256, assemble UTF8 to EOF and verify the manifest hash. Prefer receipt_dir for long output: full_result_sha256 identifies complete JSON retrievable with artifact_read(kind='receipt') without native work, then decode its manifest stdout. Public 15360-byte bound differs from the duplicated SDK envelope. summary reports ON/OFF counts and ON-only pitch/velocity ranges for observed lanes, optionally in a half-open nanosecond interval; summary requires offset0/length4096, page requires bounds absent. It still computes the whole schedule. Empty selections do not establish generator inactivity or audibility. Read reference(section='Session generators and live lanes') for timing and capture limits."""
         selection = {}
         if detail != "page":
             selection["detail"] = detail
@@ -208,8 +340,8 @@ def create_server(harness=None, *, synth_root=None):
                note_text: str = "", target: list[str] | None = None,
                text: str | None = None, receipt_dir: str | None = None,
                receipt_parent: str | None = None, receipt_purpose: str = "",
-               detail: Literal["compact", "full"] = "full") -> dict[str, Any]:
-        """Render exactly one of files or complete text. out/log are directories; log appends a take. parent_record is a record SHA256 already in that same log, not a path; omitted means no parent. Targets use KEY=V or KEY=LO..HI. Explicit compact bounds the outcome and supplies a record artifact reader; optional receipts retain its exact full result. Full remains the legacy default. wav=false synthesizes and validates without creating a WAV."""
+               detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
+        """Render exactly one of files or complete text. Supply out or log; at least one is required. out/log are directories; log appends a take. parent_record is a record SHA256 already in that same log, not a path; omitted means no parent. Targets use KEY=V or KEY=LO..HI. Explicit compact bounds the outcome and supplies a record artifact reader; optional receipts retain its exact full result. Compact is the MCP default. wav=false synthesizes and validates without creating a WAV."""
         return fm.render(files, harness=harness, out=out, wav=wav, log=log,
                          parent_record=parent_record, note_text=note_text, target=target, text=text,
                          receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose,
@@ -221,7 +353,7 @@ def create_server(harness=None, *, synth_root=None):
                 parent_record: str | None = None, note_text: str = "",
                 target: list[str] | None = None, detail: Literal["compact", "full"] = "compact",
                 receipt_parent: str | None = None, receipt_purpose: str = "") -> dict[str, Any]:
-        """Compose exactly one inline score or retained source_ref with rational quarter times, explicit streams/voices and native declaration text. Version1 has literal events; version2 adds flat phrases and finite repeats. Version3 adds explicit phrase transforms, literal chords, sampled controllers and named regions. No build, WAV, levelling or allocation. Requires explicit take-log and receipt directories (may be the same). Compact preserves actual discovery/candidate/parent calls and publication state; complete frozen source, lowered TL and maps are retained in either detail mode. Read full_result_sha256 with artifact_read(kind='receipt'); add receipt_dir as directory to receipt.source_artifact to recover source or reuse it directly as source_ref. Native owns declaration/coupled validation. First expected hash is unchecked; failed requested targets still retain a valid take. See reference(section='Musical-time scores') and reference(section='Editing and recovering scores')."""
+        """Compose exactly one inline score or retained source_ref with rational quarter times, explicit streams/voices and native declaration text. Version 1 has literal events; version2 adds flat phrases and finite repeats. Version3 adds explicit phrase transforms, literal chords, sampled controllers and named regions. No build, WAV, levelling or allocation. Requires explicit take-log and receipt directories (may be the same). Compact preserves actual discovery/candidate/parent calls and publication state; complete frozen source, lowered TL and maps are retained in either detail mode. Read full_result_sha256 with artifact_read(kind='receipt'); add receipt_dir as directory to receipt.source_artifact to recover source or reuse it directly as source_ref. Native owns declaration/coupled validation. First expected hash is unchecked; failed requested targets still retain a valid take. See reference(section='Musical-time scores') and reference(section='Editing and recovering scores')."""
         options = {"source_ref": source_ref} if source_ref is not None else {}
         return fm.compose(score, log=log, harness=harness, parent_record=parent_record,
                           note_text=note_text, target=target, detail=detail, receipt_dir=receipt_dir,
@@ -316,8 +448,8 @@ def create_server(harness=None, *, synth_root=None):
     @tool
     def log_replay(directory: str, receipt_dir: str | None = None,
                    receipt_parent: str | None = None, receipt_purpose: str = "",
-                   detail: Literal["compact", "full"] = "full") -> dict[str, Any]:
-        """Verify stored artifacts and replay every accepted take separately. Full remains the unbounded default. Explicit compact preserves actual status and returned-row counts; aborted-prefix counts can be unknown. Opt into receipt_dir for exact full evidence through artifact_read, without replaying again. No new takes or WAVs are published."""
+                   detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
+        """Verify stored artifacts and replay every accepted take separately. Compact is the MCP default. Explicit full preserves actual status and returned-row counts; aborted-prefix counts can be unknown. Opt into receipt_dir for exact full evidence through artifact_read, without replaying again. No new takes or WAVs are published."""
         options = dict(detail="compact") if detail == "compact" else {}
         return fm.log_replay(directory, harness=harness, receipt_dir=receipt_dir,
                              receipt_parent=receipt_parent, receipt_purpose=receipt_purpose, **options)
@@ -327,13 +459,15 @@ def create_server(harness=None, *, synth_root=None):
                       offset: int = 0, length: int = 8192,
                       filename: str | None = None,
                       encoding: Literal["base64", "utf8"] = "base64") -> dict[str, Any]:
-        """Verify the entire artifact before returning bytes. encoding='utf8' reads record/sfz/receipt/take_log/session_manifest/score/authored_tl/generator_manifest text; follow next_offset to EOF with the same digest and verify assembled bytes. Pages may split JSON tokens. UTF8 length is1..8192 for every supported text kind. Base64 remains default and allows1..1048576 bytes except authored_tl/generator_manifest, whose maximum is8192. score requires filename=<parent receipt SHA>.json and digest=<canonical source SHA>; verifies parent and projected source, without native work. authored_tl and generator_manifest similarly select exact text from a recognized full receipt result; both encodings allow at most8192 bytes/page, parent64MiB and selected16MiB, with a15360-byte public reply bound. Add directory to source_artifact or text_artifact locators (omit their size when calling this reader). A retained authored TL may follow a native refusal; a manifest view requires complete capture. Neither authenticates journal membership. PNG/MIDI/SFZ/ZIP require one .png/.mid/.sfz/.zip filename; record/WAV optionally accept one .tl/.wav basename, otherwise use digest-addressed log paths. Interchange delivery locators are ready reader arguments; ZIP transfers the complete bundle, while reading a directory SFZ alone omits its WAV dependencies. Every page re-verifies the complete parent/file. Manifest retrieval does not verify its bundle; use session_verify or interchange_verify for its respective format."""
+        """Verify the entire artifact before returning bytes. encoding='utf8' reads record/sfz/receipt/take_log/session_manifest/score/authored_tl/generator_manifest text; follow next_offset to EOF with the same digest and verify assembled bytes. Pages may split JSON tokens. UTF8 length is1..8192 for every supported text kind. Base64 remains default and allows 1..65536 bytes except authored_tl/generator_manifest, whose maximum is8192. score requires filename=<parent receipt SHA>.json and digest=<canonical source SHA>; verifies parent and projected source, without native work. authored_tl and generator_manifest similarly select exact text from a recognized full receipt result; both encodings allow at most8192 bytes/page, parent 64MiB and selected 16MiB, with a 15360-byte public reply bound. Add directory to source_artifact or text_artifact locators (omit their size when calling this reader). A retained authored TL may follow a native refusal; a manifest view requires complete capture. Neither authenticates journal membership. PNG/MIDI/SFZ/ZIP require one .png/.mid/.sfz/.zip filename; record/WAV optionally accept one .tl/.wav basename, otherwise use digest-addressed log paths. Interchange delivery locators are ready reader arguments; ZIP transfers the complete bundle, while reading a directory SFZ alone omits its WAV dependencies. Every page re-verifies the complete parent/file. Manifest retrieval does not verify its bundle; use session_verify or interchange_verify for its respective format."""
+        if length > 65536:
+            return dict(version=1, ok=False, exit=2, message="MCP artifact pages are limited to 65536 bytes; follow next_offset.")
         return fm.artifact_read(directory, kind=kind, digest=digest, offset=offset, length=length,
                                 filename=filename, encoding=encoding)
 
     @tool
     def session_export(sources: list[str], out: str) -> dict[str, Any]:
-        """Snapshot1..32 explicit receipt/take roots into a new verified bundle. Preserve retained indexes, JSON, TL and referenced WAV bytes; external inputs and native binaries are excluded. No rendering/replay. Output must not exist; discover original-root relocation through the manifest artifact."""
+        """Snapshot 1..32 explicit receipt/take roots into a new verified bundle. Preserve retained indexes, JSON, TL and referenced WAV bytes; external inputs and native binaries are excluded. No rendering/replay. Output must not exist; discover original-root relocation through the manifest artifact."""
         return fm.session_export(sources, out)
 
     @tool
@@ -345,7 +479,7 @@ def create_server(harness=None, *, synth_root=None):
     def midi_import(source: str, options: list[str] | None = None, out: str | None = None,
                     dry_run: bool = True, receipt_dir: str | None = None,
                     receipt_parent: str | None = None, receipt_purpose: str = "") -> dict[str, Any]:
-        """Inspect Standard MIDI File0/1 with existing conversion policies. options is argv tokens, not a shell command; discover them via reference(source='midi-options'). Default dry_run requires out omitted and performs no writes/build/render. Explicit dry_run=false requires a new out directory and uses the configured built harness. Compact output identifies canonical TL/WAV; optional receipts retain full diagnostics/dependencies without repeating conversion."""
+        """Inspect Standard MIDI File 0/1 with existing conversion policies. options is argv tokens, not a shell command; discover them via reference(source='midi-options'). Default dry_run requires out omitted and performs no writes/build/render. Explicit dry_run=false requires a new out directory and uses the configured built harness. Compact output identifies canonical TL/WAV; optional receipts retain full diagnostics/dependencies without repeating conversion."""
         return fm.midi_import(source, options=options, out=out, dry_run=dry_run,
                               harness=harness if not dry_run else None, receipt_dir=receipt_dir,
                               receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
@@ -366,7 +500,7 @@ def create_server(harness=None, *, synth_root=None):
                            tail_ms: int | None = None, max_samples: int | None = None,
                            receiver_profile: Literal["sfizz-ram"] | None = None,
                            detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
-        """Export existing local TL/recipe/input paths through the native renderer. Omit out for an actual dry-run conversion report; explicit out creates a NEW directory or ZIP, never overwrites, and means local files only. WAV retains native mono/stereo PCM. MIDI0/1 needs unique channels=['0=1','1=2'] (VOICE=CHANNEL1..16), transfers notes/timing, loses synth/FX/space, and refuses generators. sfz is a whole-song one-shot with required key0..127. sfz-bank requires patch, notes, velocities, hold_ms, tail_ms and max_samples; it samples fixed mono notes and drops song/FX/space. Materializing MIDI/sfz-bank requires accept_loss=true after reviewing losses. Default compact keeps loss categories/counts/max errors/output paths but omits per-event and per-cell arrays with counts; full returns the complete report. Published manifest.json always retains it. Delivery locators work directly with artifact_read; choose a .zip output for complete bundle transfer through MCP. No downloads/build/device sending or receipt arguments; use interchange_verify for bundled bytes."""
+        """Export existing local TL/recipe/input paths through the native renderer. Omit out for an actual dry-run conversion report; explicit out creates a NEW directory or ZIP, never overwrites, and means local files only. WAV retains native mono/stereo PCM. MIDI0/1 needs unique channels=['0=1','1=2'] (VOICE=CHANNEL1..16), transfers notes/timing, loses synth/FX/space, and refuses generators. sfz is a whole-song one-shot with required key 0..127. sfz-bank requires patch, notes, velocities, hold_ms, tail_ms and max_samples; it samples fixed mono notes and drops song/FX/space. Materializing MIDI/sfz-bank requires accept_loss=true after reviewing losses. Default compact keeps loss categories/counts/max errors/output paths but omits per-event and per-cell arrays with counts; full returns the complete report. Published manifest.json always retains it. Delivery locators work directly with artifact_read; choose a .zip output for complete bundle transfer through MCP. No downloads/build/device sending or receipt arguments; use interchange_verify for bundled bytes."""
         result = interchange.export(source, profile=profile, harness=harness, out=out, container=container,
             channels=None if channels is None else interchange.channel_map(channels), ppqn=ppqn,
             tempo_us=tempo_us, midi_format=midi_format, bend_range=bend_range, accept_loss=accept_loss,
@@ -383,7 +517,7 @@ def create_server(harness=None, *, synth_root=None):
     def transcribe(source: str, out: str, options: list[str] | None = None,
                    native_budget: int | None = None, receipt_dir: str | None = None, receipt_parent: str | None = None,
                    receipt_purpose: str = "") -> dict[str, Any]:
-        """Approximate separated mono PCM16 WAV at44.1/48kHz using the accepted transcriber. options contains existing argv tokens; discover reference(source='transcribe-options'). Requires a new out directory and uses the configured built harness in an isolated child. No build, dry run or arbitrary-song recovery guarantee. Optional native_budget caps attempted CONFIG/play calls. Check complete: a normal budget stop has exit0 but complete=false and publishes no partial score. Completed output includes a bounded note preview, editable/canonical TL, reconstruction, exact replay and unaligned source-error scores. Opt into receipt_dir before work to retrieve the complete report without repeating searches; compact output includes direct canonical TL/WAV artifact arguments. Actual native calls and template requests are distinct."""
+        """Approximate separated mono PCM16 WAV at 44.1/48kHz using the accepted transcriber. options contains existing argv tokens; discover reference(source='transcribe-options'). Requires a new out directory and uses the configured built harness in an isolated child. No build, dry run or arbitrary-song recovery guarantee. Optional native_budget caps attempted CONFIG/play calls. Check complete: a normal budget stop has exit 0 but complete=false and publishes no partial score. Completed output includes a bounded note preview, editable/canonical TL, reconstruction, exact replay and unaligned source-error scores. Opt into receipt_dir before work to retrieve the complete report without repeating searches; compact output includes direct canonical TL/WAV artifact arguments. Actual native calls and template requests are distinct."""
         return fm.transcribe(source, out, options=options, native_budget=native_budget, harness=harness,
                              receipt_dir=receipt_dir, receipt_parent=receipt_parent,
                              receipt_purpose=receipt_purpose)
@@ -443,8 +577,8 @@ def create_server(harness=None, *, synth_root=None):
         def check_patch(files: list[str] | None = None, patch_name: str | None = None,
                         fs: int = 48000, text: str | None = None,
                         receipt_dir: str | None = None, receipt_parent: str | None = None,
-                        receipt_purpose: str = "", detail: Literal["compact", "full"] = "full") -> dict[str, Any]:
-            """Check exactly one of files or timeline text; patch_name wraps bare patch lines in a silent context. No WAV or retained record is created. Explicit compact bounds the outcome; receipt_dir on this call retains the exact full result for later verified reads without rerendering. Full remains the legacy default."""
+                        receipt_purpose: str = "", detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
+            """Check exactly one of files or timeline text; patch_name wraps bare patch lines in a silent context. No WAV or retained record is created. Explicit compact bounds the outcome; receipt_dir on this call retains the exact full result for later verified reads without rerendering. Compact is the MCP default."""
             return fm.check_patch(files, harness=harness, patch_name=patch_name, fs=fs, text=text,
                                   receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose,
                                   detail=detail)
@@ -456,7 +590,7 @@ def create_server(harness=None, *, synth_root=None):
                     detail: Literal["compact", "full"] = "compact",
                     receipt_dir: str | None = None, receipt_parent: str | None = None,
                     receipt_purpose: str = "") -> dict[str, Any]:
-            """Return analyzer metrics or spectrogram metadata. Spectro requires out=.png; creates its parent. It previews inferred bars1-4, not necessarily the whole WAV; stdout states the span. Compact supplies artifact_read arguments; full includes unbounded PNG base64. Neither proves listening/viewing."""
+            """Return analyzer metrics or spectrogram metadata. Spectro requires out=.png; creates its parent. It previews inferred bars 1–4, not necessarily the whole WAV; stdout states the span. Compact supplies artifact_read arguments; full includes unbounded PNG base64. Neither proves listening/viewing."""
             return fm.analyze(wav, mode=mode, out=out, detail=detail,
                               receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
 
@@ -473,7 +607,7 @@ def create_server(harness=None, *, synth_root=None):
         def load_patch(name: str, patch: str = "patch", detail: Literal["full", "page"] = "full",
                        offset: int = 0, length: int = 4096,
                        expected_sha256: str | None = None) -> dict[str, Any]:
-            """Expand one named recipe; reference(source='recipes') only accepts index/all. Full is unchanged and unbounded. Explicit page returns UTF8 bytes (default4096,max8192); follow next_offset with expected_sha256, assemble to EOF and verify sha256. Pages re-expand without native work/WAV/storage. The15360-byte escaped public JSON bound excludes the duplicated SDK envelope; request smaller pages if needed. Text is not native-validated."""
+            """Expand one named recipe; reference(source='recipes') only accepts index/all. Full is unchanged and unbounded. Explicit page returns UTF8 bytes (default4096,max 8192); follow next_offset with expected_sha256, assemble to EOF and verify sha256. Pages re-expand without native work/WAV/storage. The 15360-byte escaped public JSON bound excludes the duplicated SDK envelope; request smaller pages if needed. Text is not native-validated."""
             options = {} if (detail == "full" and offset == 0 and length == 4096
                              and expected_sha256 is None) else dict(
                 detail=detail, offset=offset, length=length, expected_sha256=expected_sha256)
@@ -500,6 +634,7 @@ def create_server(harness=None, *, synth_root=None):
 
     native_resource("fm://params", "--params")
     native_resource("fm://gen-params", "--gen-params")
+    server.operation_functions = operation_functions
     return server
 
 
@@ -507,9 +642,31 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--harness", type=Path)
     parser.add_argument("--synth-root", type=Path)
+    parser.add_argument("--tool-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
-        create_server(args.harness, synth_root=args.synth_root).run(transport="stdio")
+        server = create_server(args.harness, synth_root=args.synth_root)
+        if args.tool_worker:
+            request = json.loads(sys.stdin.buffer.read(CAPTURE_BYTES + 1))
+            workspace = Workspace(Path.cwd())
+            workspace.validate(request["name"], request["arguments"])
+            fm, _ = operations(args.synth_root)
+            fm.WORKSPACE_ROOT = workspace.root
+            with tempfile.TemporaryDirectory(prefix=".jottune-operation-", dir=workspace.root) as temporary:
+                tempfile.tempdir = temporary
+                result = server.operation_functions[request["name"]](**request["arguments"])
+            print(json.dumps(result, allow_nan=False))
+        else:
+            # Node/clients can hand down nonblocking pipe descriptors. The SDK
+            # uses blocking file writes in worker threads, including large pages.
+            os.set_blocking(sys.stdin.fileno(), True)
+            os.set_blocking(sys.stdout.fileno(), True)
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(signum, stop_children)
+            try:
+                server.run(transport="stdio")
+            finally:
+                stop_children()
     except ImportError as error:
         print("Install requirements/core.txt in a host virtual environment: " + str(error), file=sys.stderr)
         return 5
