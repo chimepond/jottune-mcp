@@ -75,6 +75,18 @@ test('package staging pins committed source and rejects dirty or existing output
   const manifest=JSON.parse(await fs.readFile(path.join(output,'package.json'),'utf8'));
   assert.equal(manifest.name,'@chimepond/jottune-mcp');assert.equal(manifest.private,true);
   assert.equal(manifest.scripts,undefined);
+  for(const name of ['server/__pycache__/private.pyc','synth/build/harness','synth/music/song.tl','synth/data/catalog.tsv']) {
+    const file=path.join(output,name);await fs.mkdir(path.dirname(file),{recursive:true});
+    await fs.writeFile(file,'excluded package member\n');
+  }
+  const packed=JSON.parse(execFileSync('npm',['pack','--json','--offline','--ignore-scripts','--pack-destination',root],{
+    cwd:output,encoding:'utf8',stdio:['ignore','pipe','pipe'],
+    env:{...process.env,npm_config_cache:path.join(root,'npm-cache')},
+  }))[0];
+  const names=packed.files.map(file=>file.path);
+  assert.ok(names.includes('server/mcp_server.py')&&names.includes('synth/src/host/harness.c'));
+  assert.ok(!names.some(name=>name.includes('__pycache__')||name.endsWith('.pyc')||name.endsWith('.tl')||
+    name.startsWith('synth/build/')||name==='synth/data/catalog.tsv'));
   await assert.rejects(stagePackage({synthRoot:sdk,output}),/already exists/);
   await fs.writeFile(path.join(sdk,'tools/fm.py'),'changed\n');
   await assert.rejects(stagePackage({synthRoot:sdk,output:path.join(root,'dirty')}),/Commit the synth SDK/);

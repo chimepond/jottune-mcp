@@ -8,7 +8,13 @@
   "engines": {"node": ">=22"},
   "os": ["darwin", "linux"],
   "bin": {"jottune-mcp": "bin/jottune-mcp.mjs"},
-  "files": ["LICENSE", "README.md", "CHANGELOG.md", "bin/", "lib/", "server/", "requirements/", "synth/", "synth-release.json"],
+  "files": [
+    "LICENSE", "README.md", "CHANGELOG.md", "bin/*.mjs", "lib/*.mjs", "server/*.py", "requirements/*.txt",
+    "synth/LICENSE", "synth/Makefile", "synth/src/**/*.c", "synth/src/**/*.h", "synth/src/**/*.def",
+    "synth/vendor/*.h", "synth/vendor/*.md", "synth/vendor/LICENSE*", "synth/data/*.txt", "synth/data/descriptors.tsv",
+    "synth/tools/*.py", "synth/tools/*.mjs", "synth/tools/music/*.py", "synth/docs/*.md",
+    "synth/web/media.mjs", "synth/web/runtime.mjs", "synth/web/vendor/browser_wasi_shim/*", "synth-release.json"
+  ],
   "scripts": {"test": "node --test tests/*.test.mjs"},
   "repository": {"type": "git", "url": "git+https://github.com/chimepond/jottune-mcp.git"},
   "publishConfig": {"access": "public"}
