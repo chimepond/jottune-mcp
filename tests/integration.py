@@ -76,7 +76,11 @@ async def check(spec, workspace, harness, launcher, env):
             private.write_text("PRIVATE_SENTINEL=not-a-song\n")
             (workspace / "linked.tl").symlink_to(private)
             (workspace / "linked-dir").symlink_to(outside, target_is_directory=True)
+            refusal_entries = set(workspace.iterdir())
             for tool, arguments in [
+                ("interchange_export", {"source": "bell", "profile": "wav", "out": "~/jottune-refused-export.zip", "container": "zip"}),
+                ("interchange_verify", {"bundle": "~/jottune-refused-export.zip"}),
+                ("interchange_verify", {"bundle": "~root/jottune-refused-export.zip"}),
                 ("describe", {"source": str(private)}),
                 ("describe", {"source": "linked.tl"}),
                 ("compare", {"a": str(private), "b": "bell"}),
@@ -89,6 +93,8 @@ async def check(spec, workspace, harness, launcher, env):
             ]:
                 refused = await call(client, tool, arguments, ok=False)
                 assert "PRIVATE_SENTINEL" not in json.dumps(refused)
+                if any(isinstance(value, str) and value.startswith("~") for value in arguments.values()):
+                    assert set(workspace.iterdir()) == refusal_entries, "Refused home alias created a lock or output"
             assert private.read_text() == "PRIVATE_SENTINEL=not-a-song\n"
             (workspace / "linked.tl").unlink()
             (workspace / "linked-dir").unlink()

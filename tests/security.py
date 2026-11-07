@@ -37,6 +37,17 @@ class WorkspaceTests(unittest.TestCase):
                     guard.validate("compare", arguments)
             self.assertEqual(private.read_text(), "PRIVATE_SENTINEL=value")
 
+    def test_home_aliases_are_refused_before_adapter_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Workspace(Path(directory))
+            with patch.object(Path, "expanduser", side_effect=AssertionError("must not expand a home alias")) as expansion:
+                for value in ("~/new.zip", "~root/new.zip", "~", "~/../new.zip"):
+                    for name, field in (("interchange_export", "out"), ("interchange_verify", "bundle")):
+                        with self.assertRaises(WorkspaceError):
+                            guard.validate(name, {field: value})
+                expansion.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_existing_analysis_and_catalog_outputs_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

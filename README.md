@@ -82,8 +82,9 @@ A separately managed SDK/harness stays under your control.
 
 `--workspace` is the boundary for tool-selected inputs, outputs and artifact
 reads, including resolved symlink targets. Copy files into that directory before
-importing or exporting them. Analysis and catalog outputs require new paths and
-never replace existing files. The configured SDK and native executable remain
+importing or exporting them. Use workspace-relative paths or explicit contained
+paths; tilde/home aliases are refused. Analysis and catalog outputs require new
+paths and never replace existing files. The configured SDK and native executable remain
 explicit trusted startup inputs outside that directory.
 
 This is a path boundary, not an operating-system sandbox against concurrent

@@ -21,6 +21,11 @@ class Workspace:
     def path(self, value):
         if not isinstance(value, str) or not value or "\0" in value:
             raise WorkspaceError("A tool path must be a nonempty string.")
+        # Adapters differ in whether they expand '~'. Reject that alias before
+        # validation so no tool can validate a literal workspace path and then
+        # open or publish an expanded home-directory target instead.
+        if value.startswith("~"):
+            raise WorkspaceError("Use workspace-relative or explicit workspace-contained paths, not '~' aliases.")
         selected = Path(value)
         selected = selected if selected.is_absolute() else self.root / selected
         resolved = selected.resolve()
