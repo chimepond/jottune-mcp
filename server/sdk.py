@@ -14,6 +14,8 @@ REQUIRED = ("Makefile", "tools/fm.py", "tools/interchange.py", "docs/INSTRUMENT.
 def resolve_sdk(explicit=None):
     package = Path(__file__).resolve().parents[1]
     selected = explicit if explicit is not None else os.environ.get("JOTTUNE_SYNTH_ROOT")
+    if selected is not None and not str(selected).strip():
+        raise ValueError("A complete JotTune Synth SDK is required; the selected path is empty.")
     candidates = (package / "synth", package.parent / "jottune-synth") if selected is None else (Path(selected),)
     for candidate in candidates:
         directory = candidate.resolve()

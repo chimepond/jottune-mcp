@@ -37,6 +37,26 @@ test('an explicit invalid or empty SDK cannot fall back to a valid sibling',asyn
   assert.throws(()=>resolveSDK(path.join(root,'missing'),{root:packageDirectory,env:{}}),/complete JotTune/);
   assert.throws(()=>resolveSDK(undefined,{root:packageDirectory,env:{JOTTUNE_SYNTH_ROOT:''}}),/complete JotTune/);
 });
+test('the direct Python server also refuses empty explicit SDK selections',async t=>{
+  const {sdk}=await fixture(t);
+  execFileSync('python3',['-B','-c',`
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sdk import resolve_sdk
+expected = Path(sys.argv[2])
+assert resolve_sdk(expected) == expected
+for value in ('', '   ', '/unavailable-jottune-sdk'):
+    os.environ['JOTTUNE_SYNTH_ROOT'] = value
+    for explicit in (None, value):
+        try:
+            resolve_sdk(explicit)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Invalid explicit SDK was accepted')
+`,path.join(packageRoot,'server'),sdk],{cwd:sdk,stdio:['ignore','pipe','pipe']});
+});
 test('a bundled SDK takes priority over a sibling checkout',async t=>{
   const {root,sdk}=await fixture(t),packageDirectory=path.join(root,'jottune-mcp');
   await fs.mkdir(packageDirectory);
