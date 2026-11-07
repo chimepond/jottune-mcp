@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Nenad Micic
+# SPDX-License-Identifier: Apache-2.0
+"""Exercise the real stdio server and selected synth in a disposable workspace."""
+import argparse
+import asyncio
+import base64
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import wave
+
+from mcp.client import Client
+from mcp.client.stdio import StdioServerParameters
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS = set("params reference gen_events render compose score_inspect score_revise "
+            "measure_section measure_sections measure_voice_sections describe compare "
+            "log_show log_replay artifact_read session_export session_verify midi_import "
+            "interchange_inspect interchange_export interchange_verify transcribe catalog_build "
+            "search suggest probe_plan seek check_patch analyze find_patch load_patch".split())
+
+
+def run(*command, **kwargs):
+    result = subprocess.run(list(map(str, command)), capture_output=True, text=True, **kwargs)
+    assert result.returncode == 0, (command, result.returncode, result.stdout[-2000:], result.stderr[-2000:])
+    return result.stdout
+
+
+async def call(client, name, arguments, *, ok=True):
+    reply = await client.call_tool(name, arguments)
+    value = reply.structured_content
+    assert isinstance(value, dict) and value.get("ok") is ok, (name, value)
+    return value
+
+
+async def retrieve(client, locator, *, text=False):
+    offset, chunks = 0, []
+    while True:
+        page = await call(client, "artifact_read", {**locator, "offset": offset,
+                          "length": 257 if text else 65536, "encoding": "utf8" if text else "base64"})
+        assert page["offset"] == offset and page["sha256"] == locator["digest"]
+        data = page["text"].encode("utf8") if text else base64.b64decode(page["data_base64"], validate=True)
+        chunks.append(data)
+        offset += len(data)
+        if page["eof"]:
+            assert offset == page["size"]
+            break
+        assert data and len(chunks) < 4096
+    data = b"".join(chunks)
+    assert hashlib.sha256(data).hexdigest() == locator["digest"]
+    return data
+
+
+async def check(spec, workspace, harness, launcher, env):
+    async with Client(spec, mode="legacy", cache=None, read_timeout_seconds=120) as client:
+        assert client.server_info.name == "jottune-mcp"
+        inventory = await client.list_tools()
+        assert {tool.name for tool in inventory.tools} == TOOLS
+        assert all(tool.input_schema.get("additionalProperties") is False for tool in inventory.tools)
+        guide = await call(client, "reference", {"section": "Musical-time scores", "length": 8192})
+        score = json.loads(re.search(r"```json\s*(.*?)\s*```", guide["text"], re.S).group(1))
+        score["name"] = "MCP integration"
+        first = await call(client, "compose", {"score": score, "log": "takes", "receipt_dir": "operations"})
+        assert first["published"] and first["receipt"]["state"] == "complete"
+        source = {"directory": "operations", **first["receipt"]["source_artifact"]}
+        assert json.loads(await retrieve(client, source, text=True)) == score
+        edit = {"source_ref": source, "expected_source_sha256": first["source_sha256"],
+                "pointer": "/events/0/velocity_q15", "expected": score["events"][0]["velocity_q15"],
+                "value": 10000, "receipt_dir": "operations"}
+        await call(client, "score_revise", {**edit, "expected": 1}, ok=False)
+        revised = await call(client, "score_revise", edit)
+        revised_source = {"directory": "operations", **revised["receipt"]["source_artifact"]}
+        second = await call(client, "compose", {"source_ref": revised_source, "log": "takes",
+                            "receipt_dir": "operations", "parent_record": first["record_sha256"]})
+        assert second["record_sha256"] != first["record_sha256"]
+        canonical = await retrieve(client, second["artifact"], text=True)
+        rendered = await call(client, "render", {"text": canonical.decode("utf8"), "log": "audio",
+                              "wav": True, "detail": "compact"})
+        assert rendered["checks_pass"] and rendered["record_sha256"] == second["record_sha256"]
+        delivered = workspace / "delivered"
+        delivered.mkdir()
+        (delivered / "song.tl").write_bytes(await retrieve(client, rendered["artifact"], text=True))
+        wav = await retrieve(client, {"directory": "audio", "kind": "wav", "digest": rendered["wav_sha256"]})
+        (delivered / "song.wav").write_bytes(wav)
+        with wave.open(io.BytesIO(wav)) as audio:
+            assert audio.getframerate() == score["fs"] and audio.getnframes() > 0
+            assert any(audio.readframes(audio.getnframes()))
+        assert "match=yes" in run(harness, "--play", delivered / "song.tl", env=env)
+        run("node", launcher, "svg", "delivered/song.tl", "delivered/song.svg", "--workspace", workspace,
+            "--harness", harness, env=env)
+        assert "<svg" in (delivered / "song.svg").read_text()
+        exported_audio = await call(client, "interchange_export", {"source": "delivered/song.tl",
+                                    "profile": "wav", "container": "zip", "out": "delivered/audio.zip"})
+        assert exported_audio["published"]
+        await call(client, "interchange_verify", {"bundle": "delivered/audio.zip",
+                   "expected_manifest_sha256": exported_audio["bundle"]["manifest_sha256"]})
+        assert await retrieve(client, exported_audio["delivery"]["archive"]) == (delivered / "audio.zip").read_bytes()
+        bundle = await call(client, "session_export", {"sources": ["operations", "takes", "audio"], "out": "bundle"})
+        manifest = json.loads(await retrieve(client, bundle["artifact"], text=True))
+        relocated = workspace / "relocated"
+        (workspace / "bundle").rename(relocated)
+        for name in ("operations", "takes", "audio"):
+            shutil.rmtree(workspace / name)
+    async with Client(spec, mode="legacy", cache=None, read_timeout_seconds=120) as client:
+        await call(client, "session_verify", {"directory": "relocated", "expected_manifest_sha256": bundle["manifest_sha256"]})
+        member = next(item for item in manifest["files"] if item["path"].endswith(".tl"))
+        (relocated / member["path"]).write_text("corrupt\n")
+        await call(client, "session_verify", {"directory": "relocated", "expected_manifest_sha256": bundle["manifest_sha256"]}, ok=False)
+    return len(inventory.tools)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--synth-root", type=Path, required=True)
+    parser.add_argument("--harness", type=Path)
+    parser.add_argument("--launcher", type=Path, default=ROOT / "bin/jottune-mcp.mjs")
+    args = parser.parse_args()
+    sdk = args.synth_root.resolve()
+    harness = (args.harness or sdk / "build/s12e10p1v1/harness").resolve()
+    with tempfile.TemporaryDirectory(prefix="jottune-mcp-integration-") as directory:
+        workspace = Path(directory).resolve()
+        env = {**os.environ, "JOTTUNE_SYNTH_ROOT": str(sdk), "JOTTUNE_PYTHON": sys.executable,
+               "PYTHONDONTWRITEBYTECODE": "1", "MPLCONFIGDIR": str(workspace / "matplotlib")}
+        config = json.loads(run("node", args.launcher, "config", "--synth-root", sdk,
+                                "--harness", harness, "--workspace", workspace, env=env))["mcpServers"]["jottune"]
+        spec = StdioServerParameters(command=config["command"], args=config["args"], env=env, cwd=str(workspace))
+        count = asyncio.run(check(spec, workspace, harness, args.launcher, env))
+        print(f"MCP_INTEGRATION {count} tools; compose/revise/render/TL/WAV/SVG/ZIP/recovery passed")
+
+
+if __name__ == "__main__":
+    main()

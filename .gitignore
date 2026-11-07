@@ -1,0 +1,8 @@
+/dist/
+/synth/
+/node_modules/
+/.venv/
+/swarm/
+__pycache__/
+*.pyc
+.DS_Store
