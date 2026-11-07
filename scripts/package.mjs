@@ -12,6 +12,7 @@ const sdkFiles = new Set([
   'LICENSE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md',
   'tools/fm.py', 'tools/score.py', 'tools/generator.py', 'tools/measure.py',
   'tools/midi_export.py', 'tools/sample_export.py', 'tools/interchange.py',
+  'tools/export_schema.py',
   'tools/catalog.py', 'tools/receipts.py', 'tools/session.py', 'tools/recover.py',
   'tools/tl_svg.mjs', 'web/media.mjs', 'web/runtime.mjs',
 ]);

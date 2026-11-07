@@ -14,7 +14,7 @@ async function fixture(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'jottune-mcp-test-')));
   t.after(()=>fs.rm(root,{recursive:true,force:true}));
   const sdk=path.join(root,'jottune-synth');await fs.mkdir(sdk);
-  for(const file of ['LICENSE','Makefile','tools/fm.py','tools/interchange.py','docs/INSTRUMENT.md','src/host/harness.c']) {
+  for(const file of ['LICENSE','Makefile','tools/fm.py','tools/interchange.py','tools/export_schema.py','docs/INSTRUMENT.md','src/host/harness.c']) {
     await fs.mkdir(path.dirname(path.join(sdk,file)),{recursive:true});
     await fs.writeFile(path.join(sdk,file),'fixture\n');
   }
@@ -77,7 +77,7 @@ test('client configuration freezes the selected SDK and workspace paths',async t
   assert.deepEqual(entry.args,[launcher,'serve','--synth-root',sdk,'--harness',path.join(sdk,'build/s12e10p1v1/harness'),'--workspace',workspace]);
 });
 test('package selection excludes corpora, apps, infrastructure and experiments',()=>{
-  for(const file of ['src/host/harness.c','tools/fm.py','tools/music/compose.py','data/recipes.txt','web/media.mjs'])
+  for(const file of ['src/host/harness.c','tools/fm.py','tools/export_schema.py','tools/music/compose.py','data/recipes.txt','web/media.mjs'])
     assert.equal(isSDKFile(file),true,file);
   for(const file of ['music/song.tl','tests/golden/sine.tl','data/catalog.tsv','apps/macos/App.swift',
     'site/exchange.mjs','audio-text-lab/cli.mjs','tools/music/songbook/song.py','swarm/notes.md'])
@@ -105,6 +105,7 @@ test('package staging pins committed source and rejects dirty or existing output
   }))[0];
   const names=packed.files.map(file=>file.path);
   assert.ok(names.includes('server/mcp_server.py')&&names.includes('synth/src/host/harness.c'));
+  assert.ok(names.includes('synth/tools/export_schema.py'));
   assert.ok(!names.some(name=>name.includes('__pycache__')||name.endsWith('.pyc')||name.endsWith('.tl')||
     name.startsWith('synth/build/')||name==='synth/data/catalog.tsv'));
   await assert.rejects(stagePackage({synthRoot:sdk,output}),/already exists/);
