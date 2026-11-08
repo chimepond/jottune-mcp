@@ -67,7 +67,12 @@ function pythonPath() {
   fail('Python executable is unavailable; set JOTTUNE_PYTHON to your Python/venv executable.');
 }
 // One probe serves config (interpreter and MCP SDK only) and doctor (everything).
-const probeScript = `import importlib, importlib.util, json, sys
+const probeScript = `import sys
+# python -c puts the caller's directory first on sys.path. The server runs as a script, which puts its
+# own directory there instead, so the probe finds modules the way the server will.
+if sys.path and sys.path[0] == '':
+    sys.path[0] = sys.argv[4]
+import importlib, importlib.util, json
 mode, fm_path, harness, server, root = sys.argv[1:6]
 modules = {}
 for name in ('mcp.server',) if mode == 'config' else ('mcp.server', 'mcp.client', 'numpy', 'matplotlib'):
@@ -87,21 +92,31 @@ for name in ('mcp.server',) if mode == 'config' else ('mcp.server', 'mcp.client'
 report = {'version': sys.version.split()[0], 'supported': sys.version_info >= (3, 10), 'modules': modules}
 if mode == 'doctor':
     sys.path.insert(0, server)
+    fm = None
     try:
         spec = importlib.util.spec_from_file_location('jottune_doctor_fm', fm_path)
         fm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fm)
-        import sdk
-        report['api'] = {'version': getattr(fm, 'API_VERSION', None), 'supported': list(sdk.SYNTH_API_VERSIONS)}
-        try:
-            sdk.check_api(fm)
-            report['api']['compatible'] = True
-        except ValueError as error:
-            report['api'].update(compatible=False, error=str(error))
-        renderer = fm.Native(harness)
-        report['native'] = {'ok': True, 'engine': renderer.metadata.engine}
     except Exception as error:
+        fm = None
         report['native'] = {'ok': False, 'error': str(error)}
+    if fm is not None:
+        # The API report has its own try, so that it cannot mark a working renderer as failed.
+        try:
+            import sdk
+            report['api'] = {'version': getattr(fm, 'API_VERSION', None), 'supported': list(sdk.SYNTH_API_VERSIONS)}
+            try:
+                sdk.check_api(fm)
+                report['api']['compatible'] = True
+            except ValueError as error:
+                report['api'].update(compatible=False, error=str(error))
+        except Exception as error:
+            report['api'] = {'compatible': False, 'error': str(error)}
+        try:
+            renderer = fm.Native(harness)
+            report['native'] = {'ok': True, 'engine': renderer.metadata.engine}
+        except Exception as error:
+            report['native'] = {'ok': False, 'error': str(error)}
     try:
         import mcp_server
         report['server'] = {'ok': True, 'tools': len(mcp_server.create_server(harness, synth_root=root).operation_functions)}
@@ -201,7 +216,8 @@ Installation never downloads or compiles an engine. No command publishes music.`
     const engine = details.native?.ok === true;
     const capabilities = {mcp: available('mcp.server') && available('mcp.client'),
       render: engine, analysis: available('numpy'), plots: available('numpy') && available('matplotlib')};
-    const ok = capabilities.mcp && capabilities.render && details.server?.ok === true;
+    // The server does not check the synth API itself, so ok includes it (synth_api says why).
+    const ok = capabilities.mcp && capabilities.render && details.api?.compatible === true && details.server?.ok === true;
     console.log(JSON.stringify({ok, complete: ok && capabilities.analysis && capabilities.plots, capabilities,
       python, python_version: details.version || null, dependencies: details.modules || {},
       harness, engine: engine ? 'ENGINE ' + details.native.engine : null, root, workspace,

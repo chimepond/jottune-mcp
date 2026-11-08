@@ -2,6 +2,12 @@
 
 ## 0.1.0 — unpublished beta candidate
 
+- `doctor` reports the synth API version (`synth_api`) apart from the native
+  renderer. When this server does not support the version, or the synth declares
+  none, `ok` is false and `synth_api.error` says why; a working renderer is still
+  reported as working.
+- `config` and `doctor` probe the selected Python with the module search path the
+  server uses, so modules in the caller's current directory cannot change the result.
 - Link the related repositories from the README.
 - Check out text files with LF endings on every platform, so the shebang scripts
   run from any checkout; `tests/line_endings.test.mjs` checks it.

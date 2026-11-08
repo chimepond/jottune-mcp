@@ -189,3 +189,42 @@ test('package staging pins committed source and rejects dirty or existing output
   await fs.writeFile(path.join(sdk,'tools/fm.py'),'changed\n');
   await assert.rejects(stagePackage({synthRoot:sdk,output:path.join(root,'dirty')}),/Commit the synth SDK/);
 });
+test('doctor reports the synth API and the native renderer separately',async t=>{
+  const {root,sdk}=await fixture(t),workspace=path.join(root,'session');await fs.mkdir(workspace);
+  const doctor=async api=>{
+    await fs.writeFile(path.join(sdk,'tools/fm.py'),api+'class Native:\n    def __init__(self, harness):\n'+
+      "        self.metadata = type('Metadata', (), {'engine': 'fixture engine'})()\n");
+    const result=spawnSync(process.execPath,[launcher,'doctor','--synth-root',sdk,'--workspace',workspace],{encoding:'utf8'});
+    return JSON.parse(result.stdout);
+  };
+  const current=await doctor('API_VERSION = 1\n');
+  assert.equal(current.capabilities.render,true);
+  assert.equal(current.engine,'ENGINE fixture engine');
+  assert.deepEqual(current.synth_api,{version:1,supported:[1],compatible:true});
+  // An unknown or missing API version makes doctor fail, but it does not mark a working renderer as failed.
+  for(const [api,version] of [['API_VERSION = 99\n',99],['',null]]) {
+    const report=await doctor(api);
+    assert.equal(report.ok,false);assert.equal(report.complete,false);
+    assert.equal(report.capabilities.render,true);
+    assert.equal(report.engine,'ENGINE fixture engine');
+    assert.equal(report.synth_api.version,version);
+    assert.equal(report.synth_api.compatible,false);
+    assert.match(report.synth_api.error,/this server supports API version 1\./);
+  }
+});
+test('config and doctor look up Python modules as the server does, not in the caller\'s directory',async t=>{
+  // python -c puts the current directory first on sys.path. The server runs as a script and does not.
+  const {root,sdk}=await fixture(t),workspace=path.join(root,'session'),project=path.join(root,'project');
+  await fs.mkdir(workspace);await fs.mkdir(path.join(project,'mcp'),{recursive:true});
+  const plant=name=>'open('+JSON.stringify(path.join(root,name+'-was-imported'))+", 'w').close()\n";
+  await fs.writeFile(path.join(project,'json.py'),plant('json'));
+  await fs.writeFile(path.join(project,'mcp/__init__.py'),plant('mcp'));
+  await fs.writeFile(path.join(project,'mcp/server.py'),'class MCPServer: pass\n');
+  await fs.writeFile(path.join(project,'mcp/client.py'),'class Client: pass\n');
+  const launch=args=>spawnSync(process.execPath,[launcher,...args,'--synth-root',sdk,'--workspace',workspace],
+    {cwd:project,encoding:'utf8'});
+  launch(['config','--force']);
+  const doctor=JSON.parse(launch(['doctor']).stdout);
+  assert.equal(typeof doctor.python_version,'string');
+  for(const name of ['json','mcp']) await assert.rejects(fs.access(path.join(root,name+'-was-imported')),name+' was imported from the caller\'s directory');
+});

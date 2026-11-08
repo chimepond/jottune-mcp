@@ -10,6 +10,18 @@ from pathlib import Path
 import sys
 
 REQUIRED = ("Makefile", "tools/fm.py", "tools/interchange.py", "docs/INSTRUMENT.md", "src/host/harness.c")
+# The API_VERSION values of the synth's tools/fm.py that this server is written for.
+SYNTH_API_VERSIONS = (1,)
+
+
+def check_api(fm):
+    """Return fm.API_VERSION, or raise ValueError when this server does not support it."""
+    version = getattr(fm, "API_VERSION", None)
+    if version not in SYNTH_API_VERSIONS:
+        found = "no API_VERSION" if version is None else "API_VERSION " + repr(version)
+        supported = ", ".join(str(item) for item in SYNTH_API_VERSIONS)
+        raise ValueError(f"The synth tools/fm.py declares {found}; this server supports API version {supported}.")
+    return version
 
 
 def package_version():
