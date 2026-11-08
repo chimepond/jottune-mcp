@@ -12,6 +12,17 @@ Version 0.1.0 is an unpublished public beta candidate for
 `@chimepond/jottune-mcp`. Preparing or installing a local archive does not
 publish it to npm.
 
+## Related repositories
+
+- [JotTune Synth](https://github.com/chimepond/jottune-synth) is the renderer,
+  the TL format and the SDK that this server runs. Its README has the project map.
+- [Tunes](https://github.com/chimepond/tunes) is the separate readable song
+  collection.
+- [ChimePond](https://chimepond.com) is the separately operated sharing platform.
+  This server has no publication operation.
+
+Repository links become available when the public beta is published.
+
 ## Requirements
 
 For normal setup, use Node.js 24 and Python 3.12 or later. The compatible minimum

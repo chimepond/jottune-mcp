@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# Text files check out with LF endings on every platform, so the scripts with a
+# shebang run from any checkout. Git leaves binary files as they are.
+* text=auto eol=lf

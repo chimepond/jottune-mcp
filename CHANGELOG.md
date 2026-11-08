@@ -2,6 +2,9 @@
 
 ## 0.1.0 — unpublished beta candidate
 
+- Link the related repositories from the README.
+- Check out text files with LF endings on every platform, so the shebang scripts
+  run from any checkout; `tests/line_endings.test.mjs` checks it.
 - Confine MCP tool paths to the workspace and refuse destructive output reuse.
 - Isolate and bound tool execution; cancel and reap native descendants.
 - Bound default replies and use interoperable object-root tool schemas.
