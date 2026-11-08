@@ -3,15 +3,22 @@
 """Constrain caller-selected paths before any tool reads or creates files."""
 from pathlib import Path
 import os
+import stat
 
 
 class WorkspaceError(ValueError):
     pass
 
 
+LINKED = ("Workspace files must have exactly one hard link; copy the file, or remove a leftover "
+          ".*-pending-* staging directory, before using it.")
+
+
 class Workspace:
     PATHS = {"files", "out", "log", "receipt_dir", "directory", "sources", "records",
              "tsv", "among", "wav", "bundle", "a", "b"}
+    # Directory inputs are walked completely before use; this bounds that walk.
+    TREE_ENTRIES = 65536
 
     def __init__(self, root):
         self.root = Path(root).resolve(strict=True)
@@ -34,6 +41,43 @@ class Workspace:
         # Refuse special files before an adapter can block while opening one.
         if resolved.exists() and not (resolved.is_file() or resolved.is_dir()):
             raise WorkspaceError("Tool paths must select regular files or directories.")
+        # A second hard link can name a file outside the workspace; the path
+        # alone cannot show which name is the original.
+        if resolved.is_file() and resolved.stat().st_nlink > 1:
+            raise WorkspaceError(LINKED)
+        return resolved
+
+    def tree(self, directory):
+        """Apply the path rules to every entry an adapter could read below a directory."""
+        pending, seen, count = [directory], set(), 0
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    count += 1
+                    if count > self.TREE_ENTRIES:
+                        raise WorkspaceError("Directory inputs are limited to " + str(self.TREE_ENTRIES)
+                                             + " entries; select a smaller directory.")
+                    if entry.is_symlink():
+                        target = self.path(entry.path)
+                        if target.is_dir():
+                            pending.append(target)
+                        continue
+                    status = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(status.st_mode):
+                        pending.append(Path(entry.path))
+                    elif not stat.S_ISREG(status.st_mode):
+                        raise WorkspaceError("Tool paths must select regular files or directories.")
+                    elif status.st_nlink > 1:
+                        raise WorkspaceError(LINKED)
+
+    def checked(self, value):
+        resolved = self.path(value)
+        if resolved.is_dir():
+            self.tree(resolved)
         return resolved
 
     def validate(self, name, arguments):
@@ -42,17 +86,21 @@ class Workspace:
                 continue
             if (key in self.PATHS and (key != "wav" or name == "analyze")) or key == "source" and name != "reference":
                 for item in value if isinstance(value, list) else [value]:
-                    self.path(item)
+                    self.checked(item)
             elif key == "source_ref" and isinstance(value, dict):
-                self.path(value.get("directory"))
+                self.checked(value.get("directory"))
         if name == "midi_import":
             options = arguments.get("options") or []
             for index, option in enumerate(options):
                 key, separator, inline = option.partition("=")
-                if key in ("--tuning", "--scala"):
+                # Match every abbreviation a parser could expand, not only exact names.
+                files = [full for full in ("--tuning", "--scala") if len(key) > 2 and full.startswith(key)]
+                if files:
                     selected = inline if separator else options[index + 1] if index + 1 < len(options) else ""
-                    for item in selected.split(":") if key == "--scala" else [selected]:
-                        self.path(item)
+                    scala = "--scala" in files
+                    for item in ({selected, selected.rpartition(":")[0] or selected, *selected.split(":")}
+                                 if scala else [selected]):
+                        self.checked(item)
         # These two historical adapters overwrite files. MCP always requires a
         # new file; the native/public adapters also publish exclusively.
         if name in ("analyze", "catalog_build") and arguments.get("out") is not None:

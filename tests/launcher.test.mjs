@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {execFileSync} from 'node:child_process';
+import {execFileSync,spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import test from 'node:test';
 import {resolveSDK,packageRoot} from '../lib/sdk.mjs';
@@ -91,12 +91,62 @@ test('help and requirement discovery work before an SDK is available',()=>{
   assert.equal(run(['requirements'],env).trim(),path.join(packageRoot,'requirements/core.txt'));
   assert.equal(run(['requirements','--plots'],env).trim(),path.join(packageRoot,'requirements/plots.txt'));
 });
+// A stand-in interpreter that answers the launcher's Python probe with a fixed report.
+async function stubPython(root,name,report) {
+  const file=path.join(root,name);
+  // Quote for sh: a ' inside the report (as in No module named 'mcp') must survive.
+  await fs.writeFile(file,'#!/bin/sh\necho \''+JSON.stringify(report).replace(/'/g,"'\\''")+'\'\n');await fs.chmod(file,0o755);
+  return file;
+}
+const usablePython={version:'3.12.3',supported:true,modules:{'mcp.server':{ok:true}}};
 test('client configuration freezes the selected SDK and workspace paths',async t=>{
   const {root,sdk}=await fixture(t),workspace=path.join(root,'session');await fs.mkdir(workspace);
-  const value=JSON.parse(run(['config','--synth-root',sdk,'--workspace',workspace],{JOTTUNE_PYTHON:process.execPath}));
+  const python=await stubPython(root,'python',usablePython);
+  const value=JSON.parse(run(['config','--synth-root',sdk,'--workspace',workspace],{JOTTUNE_PYTHON:python}));
   const entry=value.mcpServers.jottune;
   assert.equal(await fs.realpath(entry.command),await fs.realpath(process.execPath));
   assert.deepEqual(entry.args,[launcher,'serve','--synth-root',sdk,'--harness',path.join(sdk,'build/s12e10p1v1/harness'),'--workspace',workspace]);
+  assert.deepEqual(entry.env,{JOTTUNE_PYTHON:python});
+});
+test('client configuration refuses a Python that cannot run the server unless forced',async t=>{
+  const {root,sdk}=await fixture(t),workspace=path.join(root,'session');await fs.mkdir(workspace);
+  const cases=[[await stubPython(root,'old',{version:'3.9.6',supported:false,modules:{'mcp.server':{ok:false,error:"No module named 'mcp'"}}}),/3\.9\.6.*3\.10/],
+    [await stubPython(root,'bare',{version:'3.12.3',supported:true,modules:{'mcp.server':{ok:false,error:"No module named 'mcp'"}}}),/No module named 'mcp'/],
+    [process.execPath,/could not be started|did not report/]];
+  for(const [python,reason] of cases) {
+    const refused=spawnSync(process.execPath,[launcher,'config','--synth-root',sdk,'--workspace',workspace],
+      {env:{...process.env,JOTTUNE_PYTHON:python},encoding:'utf8'});
+    assert.equal(refused.status,2,python);assert.equal(refused.stdout,'');
+    assert.match(refused.stderr,reason);assert.match(refused.stderr,/requirements\/core\.txt/);assert.match(refused.stderr,/--force/);
+    const forced=spawnSync(process.execPath,[launcher,'config','--force','--synth-root',sdk,'--workspace',workspace],
+      {env:{...process.env,JOTTUNE_PYTHON:python},encoding:'utf8'});
+    assert.equal(forced.status,0,python);assert.match(forced.stderr,/warning/i);
+    assert.equal(JSON.parse(forced.stdout).mcpServers.jottune.env.JOTTUNE_PYTHON,python);
+  }
+});
+test('a signal death of the server is reported as 128 plus the signal number',async t=>{
+  const {root,sdk}=await fixture(t),workspace=path.join(root,'session');await fs.mkdir(workspace);
+  const harness=path.join(root,'harness');await fs.writeFile(harness,'fixture\n');
+  for(const [name,status] of [['KILL',137],['SEGV',139],['TERM',143]]) {
+    const python=path.join(root,'python-'+name);
+    await fs.writeFile(python,'#!/bin/sh\nkill -'+name+' $$\n');await fs.chmod(python,0o755);
+    const result=spawnSync(process.execPath,[launcher,'serve','--synth-root',sdk,'--harness',harness,'--workspace',workspace],
+      {env:{...process.env,JOTTUNE_PYTHON:python},input:'',encoding:'utf8'});
+    assert.equal(result.status,status,name);
+  }
+});
+test('build without a C compiler explains how to install one and leaves no build directory',async t=>{
+  const {root,sdk}=await fixture(t),bin=path.join(root,'bin');await fs.mkdir(bin);
+  await fs.writeFile(path.join(sdk,'Makefile'),'CC ?= cc\nB := build/s12e10p1v1\nall: $(B)/harness\n$(B):\n\tmkdir -p $@\n'+
+    '$(B)/harness: | $(B)\n\t$(CC) -o $@ src/host/harness.c\n');
+  for(const tool of ['make','mkdir'])
+    await fs.symlink(execFileSync('/bin/sh',['-c','command -v '+tool],{encoding:'utf8'}).trim(),path.join(bin,tool));
+  const env={...process.env,PATH:bin};delete env.CC;delete env.HOSTCC;
+  const result=spawnSync(process.execPath,[launcher,'build','--synth-root',sdk],{env,encoding:'utf8'});
+  assert.equal(result.status,2);
+  assert.match(result.stderr,/C99 compiler/);assert.match(result.stderr,/xcode-select --install/);assert.match(result.stderr,/build-essential/);
+  assert.doesNotMatch(result.stderr,/No such file or directory/);
+  await assert.rejects(fs.lstat(path.join(sdk,'build')),{code:'ENOENT'});
 });
 test('package selection excludes corpora, apps, infrastructure and experiments',()=>{
   for(const file of ['src/host/harness.c','tools/fm.py','tools/export_schema.py','tools/music/compose.py','data/recipes.txt','web/media.mjs'])

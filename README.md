@@ -83,24 +83,57 @@ A separately managed SDK/harness stays under your control.
 `--workspace` is the boundary for tool-selected inputs, outputs and artifact
 reads, including resolved symlink targets. Copy files into that directory before
 importing or exporting them. Use workspace-relative paths or explicit contained
-paths; tilde/home aliases are refused. Analysis and catalog outputs require new
-paths and never replace existing files. The configured SDK and native executable remain
-explicit trusted startup inputs outside that directory.
+paths; tilde/home aliases are refused. A directory argument is checked entry by
+entry, following symlinks, and is refused when it holds more than 65536 entries,
+a special file, or anything that resolves outside the workspace. Files with more
+than one hard link are refused, because another name for the same file can lie
+outside the workspace; copy such a file first. Analysis and catalog outputs
+require new paths and never replace existing files. The configured SDK and
+native executable remain explicit trusted startup inputs outside that directory.
 
-This is a path boundary, not an operating-system sandbox against concurrent
-changes by other processes with the same account permissions. Tools run in
-separate children with a 120-second execution limit and bounded output capture;
-cancellation, input EOF and normal termination stop their native descendants.
-MCP native rendering uses the same 192 MiB render/256 MiB memory profile as the
-browser. A timeout can leave an incomplete receipt or already completed output;
-inspect retained logs before retrying. Default replies are compact, parameter
-reads are paged, and binary artifact reads accept up to 65536 bytes per page.
+This is a path boundary, not an operating-system sandbox. Paths are checked when
+a call starts and again in its worker, but files are opened by path afterwards.
+Another process running with the same account permissions can replace a checked
+file or directory with a symlink after those checks and redirect a read or write
+outside the workspace. Use a workspace that no untrusted process can modify.
+
+Tools run in separate children with a 120-second execution limit and bounded
+output capture. At most `JOTTUNE_MCP_CONCURRENCY` calls (1 to 8, default 2) run
+at once; an invalid value stops the server at startup. Further calls wait
+without using their execution limit and can be cancelled while waiting.
+Cancellation, input EOF and normal termination stop their native descendants,
+and a worker stops itself and its native descendants shortly after its server
+is killed. MCP native rendering, including section measurements, first inspects
+the TL against the same 192 MiB render/256 MiB memory profile as the browser;
+`midi_import` and `transcribe` render inside their converters without that
+inspection. A timeout or a killed server can leave an incomplete receipt or
+already completed output; inspect retained logs before retrying.
+
+Each call works in a `.jottune-operation-*` directory in the workspace, which is
+removed when the call ends, including after a timeout or cancellation. If the
+server itself is killed, the next server start removes directories with that
+generated name whose contents have been unchanged for more than an hour. Do not
+keep your own files under that name.
+
+Default replies are compact, parameter reads are paged, and binary artifact
+reads accept up to 32768 bytes per page. A tool reply larger than 48 KiB of JSON
+is replaced by an envelope that keeps `version`, `ok`, `exit` and small fields,
+sets `truncated: true`, lists up to 256 omitted fields with their sizes in
+`reply_omitted` (counting any others in `reply_omitted_unlisted`) and names a
+paged or receipt reader in `next`; `analyze` keeps its PNG locator in
+`artifact`. As the MCP specification recommends, each reply is sent both as
+structured content and as the same JSON in a text block, so a message carries
+it twice. Clients with smaller reply limits should request compact or paged
+detail and smaller artifact pages.
 
 ## Discover and compose
 
 Discover the tools, then read `reference(section="index")`. The instrument guide
 is also available as `fm://instrument`; bounded `reference` pages avoid large
-responses. `reference(source="reference-options")` describes selectors and paging.
+responses. Each `fm://` resource also has an `fm://<name>/page/{page}` template
+that returns the same bytes in numbered JSON pages of at most 32 KiB of text;
+follow `next` and check the assembled bytes against `sha256`.
+`reference(source="reference-options")` describes selectors and paging.
 Read the musical-time score section to construct an editable score, use
 `compose`, revise it with `score_revise`, and render the canonical TL with
 `render(wav=true)`. Retrieve returned artifact locators through `artifact_read`

@@ -7,10 +7,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
+import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+import time
+import weakref
 import copy
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -23,6 +29,28 @@ from guard import Workspace, WorkspaceError
 TOOL_SECONDS = 120
 CAPTURE_BYTES = 4 * 1024 * 1024
 ACTIVE_CHILDREN = set()
+# Concurrent tool workers per server event loop; JOTTUNE_MCP_CONCURRENCY selects 1..8.
+OPERATION_SLOTS = weakref.WeakKeyDictionary()
+# Startup removes only exact operation names whose whole tree is older than this.
+OPERATION_NAME = re.compile(r"\.jottune-operation-[a-z0-9_]{8}")
+STALE_SECONDS = 3600
+# Serialized JSON bound for each copy of a tool reply (structured content and its
+# text form). Larger replies keep their identity fields and name a reader.
+REPLY_BYTES = 48 * 1024
+RESOURCE_PAGE_BYTES = 32 * 1024
+RECEIPT_NEXT = "Call again with detail='compact' and receipt_dir; artifact_read(kind='receipt') returns the complete result."
+PAGE_NEXT = "Call again with detail='page' and follow next_offset with expected_result_sha256."
+REPLY_NEXT = dict(
+    describe=PAGE_NEXT, compare=PAGE_NEXT,
+    load_patch="Call again with detail='page' and follow next_offset with expected_sha256.",
+    log_show="Call again with detail='compact' and follow next_offset; artifact_read(kind='take_log') returns the exact log.",
+    analyze="Read the PNG with artifact_read pages from artifact, or call again with detail='compact'.",
+    measure_sections=RECEIPT_NEXT, measure_voice_sections=RECEIPT_NEXT, score_inspect=RECEIPT_NEXT,
+    score_revise=RECEIPT_NEXT, suggest=RECEIPT_NEXT)
+
+
+class CaptureLimit(Exception):
+    """A worker wrote more than the bounded capture."""
 
 
 def kill_operation(pid):
@@ -59,16 +87,77 @@ def stop_children(signum=None, frame=None):
         raise SystemExit(128 + signum)
 
 
+def operation_limit():
+    value = os.environ.get("JOTTUNE_MCP_CONCURRENCY", "2")
+    if not (value.isascii() and value.isdigit() and 1 <= int(value) <= 8):
+        raise ValueError("JOTTUNE_MCP_CONCURRENCY must be an integer from 1 to 8.")
+    return int(value)
+
+
+def operation_slots():
+    loop = asyncio.get_running_loop()
+    if loop not in OPERATION_SLOTS:
+        OPERATION_SLOTS[loop] = asyncio.Semaphore(operation_limit())
+    return OPERATION_SLOTS[loop]
+
+
+def watch_server(server_pid):
+    """Stop this worker and its native groups once the server that started it is gone."""
+    while os.getppid() == server_pid:
+        time.sleep(0.2)
+    kill_operation(os.getpid())
+    os._exit(5)
+
+
+def sweep_operations(root):
+    """Remove operation directories left by a killed server; nothing else is touched."""
+    oldest = time.time() - STALE_SECONDS
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not OPERATION_NAME.fullmatch(entry.name) or not entry.is_dir(follow_symlinks=False):
+                continue
+            newest = entry.stat(follow_symlinks=False).st_mtime
+            for parent, directories, files in os.walk(entry.path):
+                for child in directories + files:
+                    newest = max(newest, os.lstat(os.path.join(parent, child)).st_mtime)
+            if newest < oldest:
+                shutil.rmtree(entry.path)
+        except OSError:
+            continue
+
+
 async def isolated_tool(name, arguments, harness, synth_root, workspace):
+    """Bound concurrent workers; a call that waits for a slot stays cancellable."""
+    try:
+        request = json.dumps({"name": name, "arguments": arguments}, allow_nan=False).encode()
+    except ValueError:
+        request = None
+    if request is None or len(request) > CAPTURE_BYTES:
+        return dict(version=1, ok=False, exit=2,
+            message="Tool requests must be finite JSON of at most 4MiB; pass large inputs as workspace files.")
+    async with operation_slots():
+        return await operation_worker(request, harness, synth_root, workspace)
+
+
+async def operation_worker(request, harness, synth_root, workspace):
     """Keep cancellation responsive and reap the complete operation process group."""
     command = [sys.executable, "-B", str(Path(__file__).resolve()), "--tool-worker",
                "--synth-root", str(synth_root)]
     if harness is not None:
         command += ["--harness", str(harness)]
     operation_temp = tempfile.TemporaryDirectory(prefix=".jottune-operation-", dir=workspace)
-    child = await asyncio.create_subprocess_exec(*command, cwd=workspace,
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True, env={**os.environ, "JOTTUNE_MCP_WORKSPACE": str(workspace), "TMPDIR": operation_temp.name})
+    try:
+        child = await asyncio.create_subprocess_exec(*command, cwd=workspace,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True, env={**os.environ, "JOTTUNE_MCP_WORKSPACE": str(workspace),
+                                         "TMPDIR": operation_temp.name, "JOTTUNE_MCP_SERVER_PID": str(os.getpid())})
+    except BaseException:
+        operation_temp.cleanup()
+        raise
     ACTIVE_CHILDREN.add(child.pid)
 
     async def read(stream, limit):
@@ -79,11 +168,11 @@ async def isolated_tool(name, arguments, harness, synth_root, workspace):
                 return b"".join(chunks)
             size += len(chunk)
             if size > limit:
-                raise ValueError("Tool output exceeds its capture limit; use compact or paged output.")
+                raise CaptureLimit()
             chunks.append(chunk)
 
     async def execute():
-        child.stdin.write(json.dumps({"name": name, "arguments": arguments}, allow_nan=False).encode())
+        child.stdin.write(request)
         await child.stdin.drain()
         child.stdin.close()
         stdout, _ = await asyncio.gather(read(child.stdout, CAPTURE_BYTES), read(child.stderr, 65536))
@@ -97,13 +186,65 @@ async def isolated_tool(name, arguments, harness, synth_root, workspace):
         return await asyncio.wait_for(execute(), TOOL_SECONDS)
     except asyncio.TimeoutError:
         return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool exceeded the 120-second execution limit; inspect retained logs before retrying.")
+    except CaptureLimit:
+        return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool output exceeds its capture limit; inspect retained logs and use compact or paged output.")
     except (OSError, ValueError, UnicodeError):
-        return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool failed or exceeded its output budget; inspect retained logs and use compact or paged output.")
+        return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool worker ended without a structured result; inspect retained logs before retrying.")
     finally:
         kill_operation(child.pid)
         await asyncio.shield(child.wait())
         ACTIVE_CHILDREN.discard(child.pid)
         operation_temp.cleanup()
+
+
+def bounded_reply(name, reply):
+    """Return reply unchanged within REPLY_BYTES; otherwise an explicit truncated envelope."""
+    size = len(json.dumps(reply))
+    if size <= REPLY_BYTES:
+        return reply
+    bounded = dict(version=reply.get("version", 1), ok=reply.get("ok") is True, exit=reply.get("exit", 5))
+    omitted, unlisted, room = {}, 0, REPLY_BYTES // 2
+    for key, value in reply.items():
+        if key in bounded:
+            continue
+        cost = len(json.dumps({key: value}))
+        if cost <= 1024 and cost <= room:
+            bounded[key] = value
+            room -= cost
+        elif len(omitted) < 256 and len(json.dumps(key)) <= 66:
+            omitted[key] = cost
+        else:
+            unlisted += 1
+    if name == "analyze" and isinstance(reply.get("png"), str) and isinstance(reply.get("png_sha256"), str):
+        png = Path(reply["png"])
+        bounded["artifact"] = dict(directory=str(png.parent), kind="png", digest=reply["png_sha256"], filename=png.name)
+    bounded.update(truncated=True, reply_bytes=size, reply_limit=REPLY_BYTES, reply_omitted=omitted,
+                   next=REPLY_NEXT.get(name, "Request compact or paged detail where the tool offers it; "
+                                       "receipt_dir with artifact_read(kind='receipt') returns complete retained results."))
+    if unlisted:
+        bounded["reply_omitted_unlisted"] = unlisted
+    return bounded
+
+
+def resource_page(uri, data, page):
+    """One numbered JSON page of a resource; pages end at a newline or a UTF-8 boundary."""
+    bounds, start = [], 0
+    while start < len(data) or not bounds:
+        end = min(start + RESOURCE_PAGE_BYTES, len(data))
+        if end < len(data):
+            newline = data.rfind(b"\n", start + RESOURCE_PAGE_BYTES // 2, end)
+            end = newline + 1 if newline >= 0 else end
+            while data[end] & 0xC0 == 0x80:
+                end -= 1
+        bounds.append((start, end))
+        start = end
+    if not re.fullmatch(r"[1-9][0-9]{0,5}", page) or int(page) > len(bounds):
+        raise ValueError("Resource pages are numbered from 1 to " + str(len(bounds)) + ".")
+    number = int(page)
+    start, end = bounds[number - 1]
+    return json.dumps(dict(version=1, uri=uri, page=number, pages=len(bounds), offset=start, length=end - start,
+                           size=len(data), sha256=hashlib.sha256(data).hexdigest(), text=data[start:end].decode("utf-8"),
+                           next=uri + "/page/" + str(number + 1) if number < len(bounds) else None), ensure_ascii=False)
 
 
 
@@ -163,6 +304,7 @@ def interchange_reply(value, detail):
 def create_server(harness=None, *, synth_root=None):
     fm, interchange = operations(synth_root)
     from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ResourceNotFoundError
     from mcp.types import CallToolResult, TextContent, ToolAnnotations
     from pydantic import TypeAdapter, ValidationError
 
@@ -218,11 +360,14 @@ def create_server(harness=None, *, synth_root=None):
                                               structured_content=reply, is_error=True)
                     try:
                         workspace.validate(name, arguments)
-                    except (WorkspaceError, OSError, ValueError):
+                    except WorkspaceError as error:
+                        # Guard messages are fixed text; they never echo caller paths.
+                        reply = dict(version=1, ok=False, exit=2, message=str(error))
+                    except (OSError, ValueError):
                         reply = dict(version=1, ok=False, exit=2,
                             message="Tool paths must remain inside the workspace and outputs must use new paths.")
                     else:
-                        reply = await isolated_tool(name, arguments, harness, fm.ROOT, workspace.root)
+                        reply = bounded_reply(name, await isolated_tool(name, arguments, harness, fm.ROOT, workspace.root))
                     return CallToolResult(content=[TextContent(type="text", text=json.dumps(reply))],
                         structured_content=reply, is_error=not reply.get("ok", False))
             return await super().call_tool(name, arguments, context)
@@ -264,7 +409,7 @@ def create_server(harness=None, *, synth_root=None):
         instructions="Start with reference() for the instrument in bounded text pages. "
         "reference(source='reference-options') describes each source's selectors, copyable requests and declared reference costs without native work. "
         "Use reference(section='index') to discover guide topics and reference(source='params', section='send') for native fields. "
-        "Follow next_offset and keep source/selection hashes equal across pages. Bulk resources may exceed client limits. "
+        "Follow next_offset and keep source/selection hashes equal across pages. Bulk fm:// resources may exceed client limits; their fm://<name>/page/{page} templates return numbered 32KiB JSON pages. A tool reply over 48KiB keeps version/ok/exit and small fields, sets truncated=true and names a paged or receipt reader in next. "
         "Native validation is authoritative. "
         "compose accepts explicit rational musical-time scores, requires log and receipt_dir, "
         "and retains lowered text and native outcomes without WAV; its default reply is compact. "
@@ -364,7 +509,7 @@ def create_server(harness=None, *, synth_root=None):
                       source_ref: dict[str, Any] | None = None, start: int | str = 0, end: int | str | None = None,
                       detail: Literal["compact", "full"] = "compact",
                       receipt_parent: str | None = None, receipt_purpose: str = "") -> dict[str, Any]:
-        """Inspect exactly one inline score or retained source_ref. start/end are rational quarter coordinates. Report sections, voice uses and advisory gate conflicts from complete authored history; native bindings/generator activity/audibility remain unknown. Zero native work. Compact bounds delivery; full is unbounded. Required receipts retain complete tables and frozen source. Read full_result_sha256 with artifact_read(kind='receipt'); receipt.source_artifact gives the exact source reader relative to receipt_dir. See reference(section='Editing and recovering scores')."""
+        """Inspect exactly one inline score or retained source_ref. start/end are rational quarter coordinates. Report sections, voice uses and advisory gate conflicts from complete authored history; native bindings/generator activity/audibility remain unknown. Zero native work. Compact bounds delivery; full over 48KiB returns a truncated envelope. Required receipts retain complete tables and frozen source. Read full_result_sha256 with artifact_read(kind='receipt'); receipt.source_artifact gives the exact source reader relative to receipt_dir. See reference(section='Editing and recovering scores')."""
         return fm.score_inspect(score, source_ref=source_ref, start=start, end=end, detail=detail,
                                 receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
 
@@ -373,7 +518,7 @@ def create_server(harness=None, *, synth_root=None):
                      score: dict[str, Any] | None = None, source_ref: dict[str, Any] | None = None,
                      detail: Literal["compact", "full"] = "compact",
                      receipt_parent: str | None = None, receipt_purpose: str = "") -> dict[str, Any]:
-        """Replace one existing RFC6901 source pointer guarded by exact source SHA and expected old value. Arrays/root can be replaced explicitly. Definition edits fan out to every phrase use; one occurrence needs explicit source restructuring. Reports exact differences and clock/order effects, without guessing note identity or acoustic equivalence. Zero native work; no take is published. Use receipt.source_artifact (plus receipt_dir) as source_ref in compose for native validation and explicit parent_record lineage. Compact retains full source/diff through required receipts; full is unbounded."""
+        """Replace one existing RFC6901 source pointer guarded by exact source SHA and expected old value. Arrays/root can be replaced explicitly. Definition edits fan out to every phrase use; one occurrence needs explicit source restructuring. Reports exact differences and clock/order effects, without guessing note identity or acoustic equivalence. Zero native work; no take is published. Use receipt.source_artifact (plus receipt_dir) as source_ref in compose for native validation and explicit parent_record lineage. Compact retains full source/diff through required receipts; full over 48KiB returns a truncated envelope."""
         return fm.score_revise(score, source_ref=source_ref, expected_source_sha256=expected_source_sha256,
                                pointer=pointer, expected=expected, value=value, detail=detail,
                                receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
@@ -392,7 +537,7 @@ def create_server(harness=None, *, synth_root=None):
                          text: str | None = None, detail: Literal["compact", "full"] = "compact",
                          receipt_dir: str | None = None, receipt_parent: str | None = None,
                          receipt_purpose: str = "") -> dict[str, Any]:
-        """Measure1..32 ordered whole-mix final-PCM sections from one complete checked render pair. Each section contains only optional start_ns (default0) and end_ns (defaultnull=record end); uint64 bounds, overlaps/repeats allowed, order preserved. Exact peak, energy, integer RMS and selected PCM hash with full prior history. No regular audio file or full Python PCM buffer; native retains two full buffers. Admission512MiB finalPCM,120s aggregate child/capture budget plus bounded cleanup effort; no global RSS/disk/filesystem deadline guarantee. AmbiX reports component energy, not decoded ears/localization. Native checks remain full-record and mismatchexit3. Compact omits bulk detail explicitly; receipt_dir retains complete evidence for verified recovery without rerendering."""
+        """Measure1..32 ordered whole-mix final-PCM sections from one complete checked render pair. Each section contains only optional start_ns (default0) and end_ns (defaultnull=record end); uint64 bounds, overlaps/repeats allowed, order preserved. Exact peak, energy, integer RMS and selected PCM hash with full prior history. No regular audio file or full Python PCM buffer; native retains two full buffers. Under MCP one inspection first applies the 192MiB render/256MiB memory profile. Admission512MiB finalPCM,120s aggregate child/capture budget plus bounded cleanup effort; no global RSS/disk/filesystem deadline guarantee. AmbiX reports component energy, not decoded ears/localization. Native checks remain full-record and mismatchexit3. Compact omits bulk detail explicitly; receipt_dir retains complete evidence for verified recovery without rerendering."""
         return fm.measure_sections(files, text=text, harness=harness, sections=sections, detail=detail,
                                    receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
 
@@ -402,7 +547,7 @@ def create_server(harness=None, *, synth_root=None):
                                detail: Literal["compact", "full"] = "compact",
                                receipt_dir: str | None = None, receipt_parent: str | None = None,
                                receipt_purpose: str = "") -> dict[str, Any]:
-        """Measure1..64 distinct native dry voices in1..32 ordered sections with complete prior history. Raw signed32 Q2.30 is after voice synthesis/filter/amp but before crusher, sends, pan, pinna or master; unity is2^30, not conventional PCM32 amplitude. Normally3 native children and3 synthesis passes: two unchanged final-mix checks plus one dry rerender, whose runtime twin is unchecked. All declared voices are transported even when selecting one. No audio file/full Python PCM; two full native final16 buffers remain. Each representation capped512MiB, cooperative120s child/capture deadline plus bounded cleanup effort; no total RSS/lifetime guarantee. Exact integer peak/energy/RMS and per-voice hashes; no group, image, loudness or listening claim. Separate completion flags preserve earlier evidence on failure. Receipts recover full text/statistics after restart, not unretained dry audio."""
+        """Measure1..64 distinct native dry voices in1..32 ordered sections with complete prior history. Raw signed32 Q2.30 is after voice synthesis/filter/amp but before crusher, sends, pan, pinna or master; unity is2^30, not conventional PCM32 amplitude. Normally3 native children (4 under MCP, which first inspects against the 192MiB render/256MiB memory profile) and3 synthesis passes: two unchanged final-mix checks plus one dry rerender, whose runtime twin is unchecked. All declared voices are transported even when selecting one. No audio file/full Python PCM; two full native final16 buffers remain. Each representation capped512MiB, cooperative120s child/capture deadline plus bounded cleanup effort; no total RSS/lifetime guarantee. Exact integer peak/energy/RMS and per-voice hashes; no group, image, loudness or listening claim. Separate completion flags preserve earlier evidence on failure. Receipts recover full text/statistics after restart, not unretained dry audio."""
         return fm.measure_voice_sections(files, text=text, harness=harness, voices=voices,
             sections=sections, detail=detail, receipt_dir=receipt_dir,
             receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
@@ -430,7 +575,7 @@ def create_server(harness=None, *, synth_root=None):
                 end_ns: int | None = None, window_offset: int = 0, window_limit: int = 8,
                 receipt_dir: str | None = None, receipt_parent: str | None = None,
                 receipt_purpose: str = "") -> dict[str, Any]:
-        """Compare timelines/WAVs; deltas are [a,b,b-a]. Targets address numeric dictionary paths, e.g. a.clipped=0 and b.clipped=0 for rendered timelines. WAV operands do not expose native clipping counts; those and bare clipped stay unchecked. Compact preserves computed verdicts/counts and marks omissions. Page recomputes full data; follow next_offset with expected_result_sha256. Legacy summary/full are unbounded."""
+        """Compare timelines/WAVs; deltas are [a,b,b-a]. Targets address numeric dictionary paths, e.g. a.clipped=0 and b.clipped=0 for rendered timelines. WAV operands do not expose native clipping counts; those and bare clipped stay unchecked. Compact preserves computed verdicts/counts and marks omissions. Page recomputes full data; follow next_offset with expected_result_sha256. Legacy summary/full over 48KiB return a truncated envelope; use page."""
         return fm.compare(a, b, harness=harness, measure=measure, note=note, target=target, detail=detail,
                           offset=offset, length=length, expected_result_sha256=expected_result_sha256,
                           start_ns=start_ns, end_ns=end_ns, window_offset=window_offset, window_limit=window_limit,
@@ -441,7 +586,7 @@ def create_server(harness=None, *, synth_root=None):
                  offset: int = 0, limit: int = 20,
                  expected_index_sha256: str | None = None,
                  detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
-        """Verify the entire log before paging takes or operations with an index SHA guard. Compact takes omit notes/diffs and inline TSV; artifact_read(kind='take_log') retrieves exact TSV bytes. Full takes are unbounded. Operations remain compact; pending means outcome unknown."""
+        """Verify the entire log before paging takes or operations with an index SHA guard. Compact takes omit notes/diffs and inline TSV; artifact_read(kind='take_log') retrieves exact TSV bytes. Full takes over 48KiB return a truncated envelope. Operations remain compact; pending means outcome unknown."""
         return fm.log_show(directory, kind=kind, offset=offset, limit=limit,
                            expected_index_sha256=expected_index_sha256, detail=detail)
 
@@ -459,9 +604,9 @@ def create_server(harness=None, *, synth_root=None):
                       offset: int = 0, length: int = 8192,
                       filename: str | None = None,
                       encoding: Literal["base64", "utf8"] = "base64") -> dict[str, Any]:
-        """Verify the entire artifact before returning bytes. encoding='utf8' reads record/sfz/receipt/take_log/session_manifest/score/authored_tl/generator_manifest text; follow next_offset to EOF with the same digest and verify assembled bytes. Pages may split JSON tokens. UTF8 length is1..8192 for every supported text kind. Base64 remains default and allows 1..65536 bytes except authored_tl/generator_manifest, whose maximum is8192. score requires filename=<parent receipt SHA>.json and digest=<canonical source SHA>; verifies parent and projected source, without native work. authored_tl and generator_manifest similarly select exact text from a recognized full receipt result; both encodings allow at most8192 bytes/page, parent 64MiB and selected 16MiB, with a 15360-byte public reply bound. Add directory to source_artifact or text_artifact locators (omit their size when calling this reader). A retained authored TL may follow a native refusal; a manifest view requires complete capture. Neither authenticates journal membership. PNG/MIDI/SFZ/ZIP require one .png/.mid/.sfz/.zip filename; record/WAV optionally accept one .tl/.wav basename, otherwise use digest-addressed log paths. Interchange delivery locators are ready reader arguments; ZIP transfers the complete bundle, while reading a directory SFZ alone omits its WAV dependencies. Every page re-verifies the complete parent/file. Manifest retrieval does not verify its bundle; use session_verify or interchange_verify for its respective format."""
-        if length > 65536:
-            return dict(version=1, ok=False, exit=2, message="MCP artifact pages are limited to 65536 bytes; follow next_offset.")
+        """Verify the entire artifact before returning bytes. encoding='utf8' reads record/sfz/receipt/take_log/session_manifest/score/authored_tl/generator_manifest text; follow next_offset to EOF with the same digest and verify assembled bytes. Pages may split JSON tokens. UTF8 length is1..8192 for every supported text kind. Base64 remains default and allows 1..32768 bytes except authored_tl/generator_manifest, whose maximum is8192. score requires filename=<parent receipt SHA>.json and digest=<canonical source SHA>; verifies parent and projected source, without native work. authored_tl and generator_manifest similarly select exact text from a recognized full receipt result; both encodings allow at most8192 bytes/page, parent 64MiB and selected 16MiB, with a 15360-byte public reply bound. Add directory to source_artifact or text_artifact locators (omit their size when calling this reader). A retained authored TL may follow a native refusal; a manifest view requires complete capture. Neither authenticates journal membership. PNG/MIDI/SFZ/ZIP require one .png/.mid/.sfz/.zip filename; record/WAV optionally accept one .tl/.wav basename, otherwise use digest-addressed log paths. Interchange delivery locators are ready reader arguments; ZIP transfers the complete bundle, while reading a directory SFZ alone omits its WAV dependencies. Every page re-verifies the complete parent/file. Manifest retrieval does not verify its bundle; use session_verify or interchange_verify for its respective format."""
+        if length > 32768:
+            return dict(version=1, ok=False, exit=2, message="MCP artifact pages are limited to 32768 bytes; follow next_offset.")
         return fm.artifact_read(directory, kind=kind, digest=digest, offset=offset, length=length,
                                 filename=filename, encoding=encoding)
 
@@ -544,7 +689,7 @@ def create_server(harness=None, *, synth_root=None):
                 detail: Literal["compact", "full"] = "compact",
                 receipt_dir: str | None = None, receipt_parent: str | None = None,
                 receipt_purpose: str = "") -> dict[str, Any]:
-        """Rank measured patches; probe only when requested. Compact omits bulk candidates; receipt_dir retains the complete result for artifact_read without repeating renders. Full is unbounded and executes a new operation."""
+        """Rank measured patches; probe only when requested. Compact omits bulk candidates; receipt_dir retains the complete result for artifact_read without repeating renders. Full executes a new operation; over 48KiB it returns a truncated envelope."""
         return fm.suggest(target, source=source, patch=patch, probe=probe, among=among,
                           note=note, tsv=tsv, harness=harness, offset=offset, limit=limit, detail=detail,
                           receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
@@ -590,7 +735,7 @@ def create_server(harness=None, *, synth_root=None):
                     detail: Literal["compact", "full"] = "compact",
                     receipt_dir: str | None = None, receipt_parent: str | None = None,
                     receipt_purpose: str = "") -> dict[str, Any]:
-            """Return analyzer metrics or spectrogram metadata. Spectro requires out=.png; creates its parent. It previews inferred bars 1–4, not necessarily the whole WAV; stdout states the span. Compact supplies artifact_read arguments; full includes unbounded PNG base64. Neither proves listening/viewing."""
+            """Return analyzer metrics or spectrogram metadata. Spectro requires out=.png; creates its parent. It previews inferred bars 1–4, not necessarily the whole WAV; stdout states the span. Compact supplies artifact_read arguments; full includes PNG base64 unless the reply exceeds 48KiB, which returns the artifact locator instead. Neither proves listening/viewing."""
             return fm.analyze(wav, mode=mode, out=out, detail=detail,
                               receipt_dir=receipt_dir, receipt_parent=receipt_parent, receipt_purpose=receipt_purpose)
 
@@ -607,16 +752,29 @@ def create_server(harness=None, *, synth_root=None):
         def load_patch(name: str, patch: str = "patch", detail: Literal["full", "page"] = "full",
                        offset: int = 0, length: int = 4096,
                        expected_sha256: str | None = None) -> dict[str, Any]:
-            """Expand one named recipe; reference(source='recipes') only accepts index/all. Full is unchanged and unbounded. Explicit page returns UTF8 bytes (default4096,max 8192); follow next_offset with expected_sha256, assemble to EOF and verify sha256. Pages re-expand without native work/WAV/storage. The 15360-byte escaped public JSON bound excludes the duplicated SDK envelope; request smaller pages if needed. Text is not native-validated."""
+            """Expand one named recipe; reference(source='recipes') only accepts index/all. Full is unchanged; over 48KiB it returns a truncated envelope. Explicit page returns UTF8 bytes (default4096,max 8192); follow next_offset with expected_sha256, assemble to EOF and verify sha256. Pages re-expand without native work/WAV/storage. The 15360-byte escaped public JSON bound excludes the duplicated SDK envelope; request smaller pages if needed. Text is not native-validated."""
             options = {} if (detail == "full" and offset == 0 and length == 4096
                              and expected_sha256 is None) else dict(
                 detail=detail, offset=offset, length=length, expected_sha256=expected_sha256)
             return fm.load_patch(name, patch=patch, **options)
 
+    def paged_resource(uri, name, read):
+        def page(page: str) -> str:
+            data = read().encode("utf-8")
+            try:
+                return resource_page(uri, data, page)
+            except ValueError as error:
+                raise ResourceNotFoundError(str(error)) from None
+        server.resource(uri + "/page/{page}", name=name + " pages", mime_type="application/json",
+            description="The same bytes as " + uri + " in numbered JSON pages of at most 32KiB text from page 1; "
+            "follow next and check the assembled bytes against sha256.")(page)
+
     def file_resource(uri, relative, mime):
         def read() -> str:
             return (fm.ROOT / relative).read_bytes().decode("utf-8")
-        server.resource(uri, name=relative, mime_type=mime)(read)
+        server.resource(uri, name=relative, mime_type=mime, description="Complete " + relative + "; "
+            "large for some clients, so " + uri + "/page/{page} returns bounded pages.")(read)
+        paged_resource(uri, relative, read)
 
     file_resource("fm://instrument", "docs/INSTRUMENT.md", "text/markdown")
     file_resource("fm://recipes", "data/recipes.txt", "text/plain")
@@ -630,7 +788,9 @@ def create_server(harness=None, *, synth_root=None):
             result = native.run([option])
             fm.require(result.returncode == 0, result.stderr, result.returncode)
             return result.stdout
-        server.resource(uri, name=option, mime_type="text/plain")(read)
+        server.resource(uri, name=option, mime_type="text/plain", description="Complete native " + option + " listing; "
+            "large for some clients, so " + uri + "/page/{page} returns bounded pages.")(read)
+        paged_resource(uri, option, read)
 
     native_resource("fm://params", "--params")
     native_resource("fm://gen-params", "--gen-params")
@@ -647,16 +807,35 @@ def main(argv=None):
     try:
         server = create_server(args.harness, synth_root=args.synth_root)
         if args.tool_worker:
-            request = json.loads(sys.stdin.buffer.read(CAPTURE_BYTES + 1))
-            workspace = Workspace(Path.cwd())
-            workspace.validate(request["name"], request["arguments"])
+            # A server killed without cleanup must not leave this worker publishing.
+            server_pid = os.environ.get("JOTTUNE_MCP_SERVER_PID")
+            if server_pid is not None and os.getpgrp() == os.getpid():
+                threading.Thread(target=watch_server, args=(int(server_pid),), daemon=True).start()
+            try:
+                request = json.loads(sys.stdin.buffer.read(CAPTURE_BYTES + 1))
+                workspace = Workspace(Path.cwd())
+                workspace.validate(request["name"], request["arguments"])
+            except WorkspaceError as error:
+                print(json.dumps(dict(version=1, ok=False, exit=2,
+                                      message="Tool inputs changed after validation: " + str(error))))
+                return 2
+            except (OSError, ValueError, KeyError, TypeError):
+                print(json.dumps(dict(version=1, ok=False, exit=2, message="Tool request could not be read.")))
+                return 2
             fm, _ = operations(args.synth_root)
             fm.WORKSPACE_ROOT = workspace.root
-            with tempfile.TemporaryDirectory(prefix=".jottune-operation-", dir=workspace.root) as temporary:
+            # Nest inside the server's operation directory so its cleanup also
+            # removes this one after a timeout, cancellation or worker kill.
+            parent = Path(os.environ.get("TMPDIR") or workspace.root).resolve()
+            if not parent.is_dir() or not parent.is_relative_to(workspace.root):
+                parent = workspace.root
+            with tempfile.TemporaryDirectory(prefix=".jottune-operation-", dir=parent) as temporary:
                 tempfile.tempdir = temporary
                 result = server.operation_functions[request["name"]](**request["arguments"])
             print(json.dumps(result, allow_nan=False))
         else:
+            operation_limit()
+            sweep_operations(Workspace(Path.cwd()).root)
             # Node/clients can hand down nonblocking pipe descriptors. The SDK
             # uses blocking file writes in worker threads, including large pages.
             os.set_blocking(sys.stdin.fileno(), True)

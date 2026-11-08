@@ -46,7 +46,7 @@ async def retrieve(client, locator, *, text=False):
     offset, chunks = 0, []
     while True:
         page = await call(client, "artifact_read", {**locator, "offset": offset,
-                          "length": 257 if text else 65536, "encoding": "utf8" if text else "base64"})
+                          "length": 257 if text else 32768, "encoding": "utf8" if text else "base64"})
         assert page["offset"] == offset and page["sha256"] == locator["digest"]
         data = page["text"].encode("utf8") if text else base64.b64decode(page["data_base64"], validate=True)
         chunks.append(data)
@@ -100,7 +100,7 @@ async def check(spec, workspace, harness, launcher, env):
             (workspace / "linked-dir").unlink()
         parameters = await call(client, "params", {})
         assert parameters["next_offset"] is not None and len(json.dumps(parameters)) < 16384
-        await call(client, "artifact_read", {"directory": ".", "kind": "wav", "digest": "a" * 64, "length": 65537}, ok=False)
+        await call(client, "artifact_read", {"directory": ".", "kind": "wav", "digest": "a" * 64, "length": 32769}, ok=False)
         guide = await call(client, "reference", {"section": "Musical-time scores", "length": 8192})
         score = json.loads(re.search(r"```json\s*(.*?)\s*```", guide["text"], re.S).group(1))
         score["name"] = "MCP integration"

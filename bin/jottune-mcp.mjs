@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Nenad Micic
 // SPDX-License-Identifier: Apache-2.0
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn, spawnSync} from 'node:child_process';
@@ -34,9 +35,10 @@ const requirementProfiles = Object.fromEntries(['core', 'analysis', 'plots'].map
   [name, path.join(packageRoot, 'requirements', name + '.txt')]));
 const requirements = requirementProfiles.core;
 const installFor = file => [python, '-m', 'pip', 'install', '-r', file];
-function run(executable, arguments_, options = {}) {
+function run(executable, arguments_, options = {}, cleanup = () => {}) {
   const result = spawnSync(executable, arguments_, {stdio: 'inherit',
     env: {...process.env, JOTTUNE_SYNTH_ROOT: root}, ...options});
+  if (result.error || result.status !== 0) cleanup();
   if (result.error) fail(executable === 'make' && result.error.code === 'ENOENT'
     ? 'Make is unavailable. Install Make and a C99 compiler, then run jottune-mcp build again.' : result.error.message);
   process.exit(result.status ?? 1);
@@ -64,6 +66,72 @@ function pythonPath() {
   }
   fail('Python executable is unavailable; set JOTTUNE_PYTHON to your Python/venv executable.');
 }
+// One probe serves config (interpreter and MCP SDK only) and doctor (everything).
+const probeScript = `import importlib, importlib.util, json, sys
+mode, fm_path, harness, server, root = sys.argv[1:6]
+modules = {}
+for name in ('mcp.server',) if mode == 'config' else ('mcp.server', 'mcp.client', 'numpy', 'matplotlib'):
+    try:
+        module = importlib.import_module(name)
+        if name == 'mcp.server':
+            getattr(module, 'MCPServer')
+        if name == 'mcp.client':
+            getattr(module, 'Client')
+        modules[name] = {'ok': True}
+        if name == 'matplotlib':
+            # Build the font cache now; otherwise the first plot waits for it.
+            importlib.import_module('matplotlib.font_manager')
+            modules[name]['font_cache'] = module.get_cachedir()
+    except Exception as error:
+        modules[name] = {'ok': False, 'error': str(error)}
+report = {'version': sys.version.split()[0], 'supported': sys.version_info >= (3, 10), 'modules': modules}
+if mode == 'doctor':
+    sys.path.insert(0, server)
+    try:
+        spec = importlib.util.spec_from_file_location('jottune_doctor_fm', fm_path)
+        fm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fm)
+        import sdk
+        report['api'] = {'version': getattr(fm, 'API_VERSION', None), 'supported': list(sdk.SYNTH_API_VERSIONS)}
+        try:
+            sdk.check_api(fm)
+            report['api']['compatible'] = True
+        except ValueError as error:
+            report['api'].update(compatible=False, error=str(error))
+        renderer = fm.Native(harness)
+        report['native'] = {'ok': True, 'engine': renderer.metadata.engine}
+    except Exception as error:
+        report['native'] = {'ok': False, 'error': str(error)}
+    try:
+        import mcp_server
+        report['server'] = {'ok': True, 'tools': len(mcp_server.create_server(harness, synth_root=root).operation_functions)}
+    except Exception as error:
+        report['server'] = {'ok': False, 'error': str(error)}
+print(json.dumps(report))`;
+function probe(executable, mode) {
+  const check = spawnSync(executable, ['-B', '-c', probeScript, mode, path.join(root, 'tools/fm.py'), harness,
+    path.join(packageRoot, 'server'), root], {encoding: 'utf8'});
+  let details = {};
+  try { details = JSON.parse(check.stdout); } catch {}
+  return {check, details: details && typeof details === 'object' ? details : {}};
+}
+function serverProblem({check, details}) {
+  if (typeof details.version !== 'string') return 'it did not report its version' + (check.error ? ' (' + check.error.message + ')' : '');
+  if (details.supported !== true) return 'Python ' + details.version + ' is older than 3.10';
+  const mcp = details.modules?.['mcp.server'];
+  return mcp?.ok === true ? null : 'the MCP SDK is not importable (' + (mcp?.error || 'no report') + ')';
+}
+function synthRevision() {
+  // A package records its bundled SDK; a separate checkout reports its own commit.
+  try {
+    if (root === path.join(packageRoot, 'synth'))
+      return JSON.parse(fs.readFileSync(path.join(packageRoot, 'synth-release.json'), 'utf8')).source_revision ?? null;
+  } catch { return null; }
+  const git = spawnSync('git', ['-C', root, 'rev-parse', '--show-toplevel', 'HEAD'],
+    {encoding: 'utf8', env: {...process.env, GIT_OPTIONAL_LOCKS: '0'}});
+  const [top, revision] = git.status === 0 ? git.stdout.trim().split('\n') : [];
+  try { return top && fs.realpathSync(top) === root ? revision : null; } catch { return null; }
+}
 if (help) {
   console.log(`JotTune MCP: local stdio server (no remote service)
 Usage: jottune-mcp [serve] [--harness PATH] [--workspace DIR]
@@ -80,6 +148,7 @@ Install the core profile and any optional profile explicitly in your venv.
 Set JOTTUNE_PYTHON to that venv's executable. build explicitly requires Make
 and a C99 compiler; --harness or JOTTUNE_HARNESS selects an existing renderer.
 config prints a local MCP client configuration; it does not edit client files.
+It refuses a JOTTUNE_PYTHON that cannot run the server unless --force is given.
 --workspace chooses an existing session directory (default: current directory).
 Tool-selected paths stay inside that workspace, including symlink targets.
 Move files into it explicitly before composing, importing or exporting.
@@ -96,50 +165,48 @@ Installation never downloads or compiles an engine. No command publishes music.`
     process.stdout.write(fs.readFileSync(path.join(root, 'docs/INSTRUMENT.md')));
   } else if (command === 'build') {
     if (args.length) fail('build takes no arguments.');
-    run('make', ['-C', root, 'all']);
+    // Without this check Make reports only "cc: No such file or directory".
+    for (const compiler of new Set([process.env.CC || 'cc', process.env.HOSTCC || 'cc'])) {
+      const [executable, ...flags] = compiler.trim().split(/\s+/);
+      const check = spawnSync(executable, [...flags, '--version'], {stdio: 'ignore'});
+      if (check.error || check.status !== 0) fail('A C99 compiler is unavailable (' + compiler + ' did not run). ' +
+        'Install one, for example with xcode-select --install on macOS or the build-essential package on Debian or Ubuntu, ' +
+        'then run jottune-mcp build again.');
+    }
+    // Remove build directories that a failed build created and left empty.
+    const created = ['build', 'build/s12e10p1v1'].map(name => path.join(root, name)).filter(name => !fs.existsSync(name));
+    run('make', ['-C', root, 'all'], {}, () => {
+      for (const directory of created.reverse()) try { fs.rmdirSync(directory); } catch {}
+    });
   } else if (command === 'config') {
+    const force = args.includes('--force');
+    if (force) args.splice(args.indexOf('--force'), 1);
     if (args.length) fail('Unknown config arguments: ' + args.join(' '));
     checkWorkspace();
+    const executable = pythonPath(), problem = serverProblem(probe(executable, 'config'));
+    const advice = 'The selected Python (' + executable + ') cannot run the server: ' + problem +
+      '. Install requirements/core.txt in a Python 3.10+ virtual environment and set JOTTUNE_PYTHON to its executable';
+    if (problem && !force) fail(advice + ', or pass --force to print the configuration anyway.');
+    if (problem) console.error('JotTune MCP: warning: ' + advice + '.');
     console.log(JSON.stringify({mcpServers: {jottune: {
       command: nodePath(),
       args: [launcher, 'serve', '--synth-root', root, '--harness', harness, '--workspace', workspace],
-      env: {JOTTUNE_PYTHON: pythonPath()},
+      env: {JOTTUNE_PYTHON: executable},
     }}}, null, 2));
   } else if (command === 'doctor') {
     if (args.length) fail('Unknown doctor arguments: ' + args.join(' '));
     checkWorkspace();
-    const check = spawnSync(python, ['-B', '-c', `import importlib, importlib.util, json, sys
-modules = {}
-for name in ('mcp.server', 'mcp.client', 'numpy', 'matplotlib'):
-    try:
-        module = importlib.import_module(name)
-        if name == 'mcp.server':
-            getattr(module, 'MCPServer')
-        if name == 'mcp.client':
-            getattr(module, 'Client')
-        modules[name] = {'ok': True}
-    except Exception as error:
-        modules[name] = {'ok': False, 'error': str(error)}
-try:
-    spec = importlib.util.spec_from_file_location('jottune_doctor_fm', sys.argv[1])
-    fm = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fm)
-    renderer = fm.Native(sys.argv[2])
-    native = {'ok': True, 'engine': renderer.metadata.engine}
-except Exception as error:
-    native = {'ok': False, 'error': str(error)}
-print(json.dumps({'version': sys.version.split()[0], 'supported': sys.version_info >= (3, 10),
-                 'modules': modules, 'native': native}))`, path.join(root, 'tools/fm.py'), harness], {encoding: 'utf8'});
-    let details = {};
-    try { details = JSON.parse(check.stdout); } catch {}
+    const {check, details} = probe(python, 'doctor');
     const available = name => details.supported === true && details.modules?.[name]?.ok === true;
     const engine = details.native?.ok === true;
     const capabilities = {mcp: available('mcp.server') && available('mcp.client'),
       render: engine, analysis: available('numpy'), plots: available('numpy') && available('matplotlib')};
-    const ok = capabilities.mcp && capabilities.render;
+    const ok = capabilities.mcp && capabilities.render && details.server?.ok === true;
     console.log(JSON.stringify({ok, complete: ok && capabilities.analysis && capabilities.plots, capabilities,
       python, python_version: details.version || null, dependencies: details.modules || {},
-      harness, engine: engine ? 'ENGINE ' + details.native.engine : null, root, workspace, requirements,
+      harness, engine: engine ? 'ENGINE ' + details.native.engine : null, root, workspace,
+      synth_revision: synthRevision(), synth_api: details.api || null, tools: details.server?.tools ?? null,
+      server_error: details.server?.error || null, requirements,
       requirements_profiles: requirementProfiles,
       install: installFor(requirements),
       install_by_capability: {mcp: installFor(requirements),
@@ -168,6 +235,6 @@ print(json.dumps({'version': sys.version.split()[0], 'supported': sys.version_in
       child.kill(signal);
     });
     child.on('error',error=>fail(error.message));
-    child.on('exit',(code,signal)=>{process.exitCode=code ?? (signal==='SIGINT'?130:143);});
+    child.on('exit',(code,signal)=>{process.exitCode=code ?? 128 + (os.constants.signals[signal] ?? 0);});
   } else fail('Unknown command: ' + command);
 }
