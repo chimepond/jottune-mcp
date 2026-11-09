@@ -280,6 +280,57 @@ class WorkspaceTests(unittest.TestCase):
         fake.chmod(0o700)
         return fake
 
+    def test_anyio_cancellation_reaps_worker_before_releasing_its_slot(self):
+        import anyio
+        import mcp_server
+
+        async def exercise():
+            before = set(mcp_server.ACTIVE_CHILDREN)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                fake = self.slow_harness(root)
+                text = next((SDK / "examples").glob("*.tl")).read_text()
+                scopes = []
+
+                async def call():
+                    # The MCP SDK cancels tool calls through an AnyIO scope,
+                    # which delivers cancellation again at every checkpoint.
+                    with anyio.CancelScope() as scope:
+                        scopes.append(scope)
+                        await mcp_server.isolated_tool("render", {"text": text, "out": "new"},
+                                                       fake, SDK, root)
+
+                try:
+                    async with anyio.create_task_group() as group:
+                        group.start_soon(call)
+                        with anyio.fail_after(15):
+                            while not list(root.glob("running-*")):
+                                await anyio.sleep(0.02)
+                        worker_pids = set(mcp_server.ACTIVE_CHILDREN) - before
+                        self.assertEqual(len(worker_pids), 1)
+                        self.assertEqual(len(list(root.glob(".jottune-operation-*"))), 1)
+                        scopes[0].cancel()
+                    # Check immediately after the cancelled call joins, rather
+                    # than letting a server exit or a startup sweep hide leaks.
+                    self.assertEqual(mcp_server.ACTIVE_CHILDREN, before)
+                    self.assertEqual(list(root.glob(".jottune-operation-*")), [])
+                    for pid in worker_pids:
+                        state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                                               capture_output=True, text=True).stdout.strip()
+                        self.assertFalse(state, (pid, state))
+                    with anyio.fail_after(30):
+                        reply = await mcp_server.isolated_tool("reference", {"section": "index", "length": 64},
+                                                               fake, SDK, root)
+                    self.assertTrue(reply["ok"], reply)
+                    self.assertEqual(mcp_server.ACTIVE_CHILDREN, before)
+                finally:
+                    for pid in set(mcp_server.ACTIVE_CHILDREN) - before:
+                        mcp_server.kill_operation(pid)
+                        mcp_server.ACTIVE_CHILDREN.discard(pid)
+
+        with patch.dict(os.environ, {"JOTTUNE_MCP_CONCURRENCY": "1"}):
+            anyio.run(exercise, backend="asyncio")
+
     def test_worker_failures_report_their_actual_cause(self):
         import mcp_server
         from mcp_server import isolated_tool

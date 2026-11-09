@@ -175,7 +175,7 @@ The launcher also exposes `guide`, `svg` and `interchange` commands. Run
 
 ## Package and test
 
-Package a committed, clean synth checkout explicitly:
+Package committed, clean MCP and synth checkouts explicitly:
 
 ```sh
 mkdir -p dist
@@ -186,12 +186,14 @@ npm test
 .venv/bin/python tests/integration.py --synth-root ../jottune-synth
 ```
 
-The staged package contains an exact selected synth source revision, including
-the native build inputs and reusable authoring tools. It excludes song archives,
+The staged package contains tracked MCP files and an exact selected synth source
+revision, including the native build inputs, reusable authoring tools and CLI
+decoder. Ignored local modules are excluded. It excludes song archives,
 applications, sharing infrastructure, acoustic experiments and test fixtures.
-`synth-release.json` records the bundled source revision. Build the final archive
-from the committed source revision being released so that this citation resolves
-to the corresponding published SDK. Run installation and integration checks on
+`synth-release.json` records `source_revision` for the bundled SDK and
+`mcp_source_revision` for the transport/launcher. Build the final archive from
+the committed revisions being released so these citations resolve to their
+corresponding published sources. Run installation and integration checks on
 the exact archive being published. The source checkout is `private: true`, so
 publishing directly from it is refused: it does not contain the bundled SDK.
 The explicit packaging script produces a publishable manifest only after the SDK

@@ -9,10 +9,10 @@ import {fileURLToPath} from 'node:url';
 import {packageRoot, resolveSDK} from '../lib/sdk.mjs';
 
 const sdkFiles = new Set([
-  'LICENSE', 'NOTICE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md',
+  'LICENSE', 'NOTICE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md', 'docs/DECODING.md',
   'tools/fm.py', 'tools/score.py', 'tools/generator.py', 'tools/measure.py',
   'tools/midi_export.py', 'tools/sample_export.py', 'tools/interchange.py',
-  'tools/export_schema.py',
+  'tools/export_schema.py', 'tools/decode.py',
   'tools/catalog.py', 'tools/receipts.py', 'tools/session.py', 'tools/recover.py',
   'tools/tl_svg.mjs', 'web/media.mjs', 'web/runtime.mjs',
 ]);
@@ -37,38 +37,43 @@ async function copyFiles(source, destination, names) {
   }
 }
 
+async function committedSource(root, label) {
+  const git = args => execFileSync('git',args,{cwd:root,encoding:'utf8'}).trim();
+  if (await fs.realpath(git(['rev-parse','--show-toplevel'])) !== await fs.realpath(root))
+    throw Error('The '+label+' must be its own Git checkout.');
+  if (git(['status','--porcelain','--untracked-files=normal']))
+    throw Error('Commit the '+label+' before packaging.');
+  return {revision:git(['rev-parse','HEAD']), files:git(['ls-files','-z']).split('\0').filter(Boolean)};
+}
+
 export async function stagePackage({synthRoot, output}) {
   const sdk = resolveSDK(synthRoot), target = path.resolve(output);
   if (target === packageRoot || target.startsWith(sdk + path.sep) || target === sdk)
     throw Error('Choose a new output directory outside the synth SDK.');
   try {await fs.lstat(target); throw Error('Package output already exists.');}
   catch(error) {if(error.code !== 'ENOENT')throw error;}
-  const git = args => execFileSync('git',args,{cwd:sdk,encoding:'utf8'}).trim();
-  if (await fs.realpath(git(['rev-parse','--show-toplevel'])) !== sdk)
-    throw Error('The synth SDK must be its own Git checkout.');
-  if (git(['status','--porcelain','--untracked-files=normal']))
-    throw Error('Commit the synth SDK before packaging.');
-  const revision = git(['rev-parse','HEAD']);
-  const files = git(['ls-files','-z']).split('\0').filter(name => name && isSDKFile(name));
+  const synth = await committedSource(sdk,'synth SDK');
+  const mcp = await committedSource(packageRoot,'MCP source');
+  const files = synth.files.filter(isSDKFile);
+  const members = mcp.files.filter(name => ['LICENSE','SECURITY.md','README.md','CHANGELOG.md'].includes(name)
+    || /^(bin|lib)\/[^/]+\.mjs$/.test(name) || /^server\/[^/]+\.py$/.test(name)
+    || /^requirements\/[^/]+\.txt$/.test(name));
   await fs.mkdir(target,{recursive:false});
   try {
-    for (const member of ['LICENSE','SECURITY.md','README.md','CHANGELOG.md','bin','lib','server','requirements']) {
-      const input = path.join(packageRoot,member), info = await fs.lstat(input);
-      if (info.isSymbolicLink())throw Error('Package source must not contain links.');
-      await fs.cp(input,path.join(target,member),{recursive:true,filter:file=>
-        !file.split(path.sep).some(part=>part==='__pycache__') && !file.endsWith('.pyc')});
-    }
+    // Tracked members only: ignored local Python modules must never enter a release.
+    await copyFiles(packageRoot,target,members);
     const manifest = JSON.parse(await fs.readFile(path.join(packageRoot,'package.json'),'utf8'));
     delete manifest.scripts;
     await copyFiles(sdk,path.join(target,'synth'),files);
     await fs.writeFile(path.join(target,'synth-release.json'),JSON.stringify({
-      format:1, source_revision:revision, engine_source:'chimepond/jottune-synth',
+      format:1, source_revision:synth.revision, engine_source:'chimepond/jottune-synth',
+      mcp_source_revision:mcp.revision,
     },null,2)+'\n');
     // The source checkout stays private. Expose a publishable manifest only
     // after its SDK and source-revision record have been assembled successfully.
     manifest.private = false;
     await fs.writeFile(path.join(target,'package.json'),JSON.stringify(manifest,null,2)+'\n');
-    return {output:target,synth_revision:revision,synth_files:files.length};
+    return {output:target,synth_revision:synth.revision,mcp_revision:mcp.revision,synth_files:files.length};
   } catch(error) {
     await fs.rm(target,{recursive:true,force:true});
     throw error;

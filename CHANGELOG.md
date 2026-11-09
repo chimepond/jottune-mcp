@@ -2,6 +2,10 @@
 
 ## 0.1.0 — unpublished beta candidate
 
+- Complete child reaping, active-worker removal and temporary-directory cleanup
+  before returning from an AnyIO-cancelled tool call.
+- Package only tracked files from clean MCP and synth checkouts, record both
+  revisions and include the decoder used by the bundled CLI.
 - `doctor` reports the synth API version (`synth_api`) apart from the native
   renderer. When this server does not support the version, or the synth declares
   none, `ok` is false and `synth_api.error` says why; a working renderer is still

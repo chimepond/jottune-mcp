@@ -145,6 +145,8 @@ async def isolated_tool(name, arguments, harness, synth_root, workspace):
 
 async def operation_worker(request, harness, synth_root, workspace):
     """Keep cancellation responsive and reap the complete operation process group."""
+    from anyio import CancelScope
+
     command = [sys.executable, "-B", str(Path(__file__).resolve()), "--tool-worker",
                "--synth-root", str(synth_root)]
     if harness is not None:
@@ -191,10 +193,15 @@ async def operation_worker(request, harness, synth_root, workspace):
     except (OSError, ValueError, UnicodeError):
         return dict(version=1, ok=False, exit=5, publication_state="unknown", message="Tool worker ended without a structured result; inspect retained logs before retrying.")
     finally:
-        kill_operation(child.pid)
-        await asyncio.shield(child.wait())
-        ACTIVE_CHILDREN.discard(child.pid)
-        operation_temp.cleanup()
+        try:
+            # The MCP SDK uses level-triggered AnyIO cancellation. asyncio's
+            # shield alone still lets that cancelled scope interrupt this wait.
+            with CancelScope(shield=True):
+                kill_operation(child.pid)
+                await asyncio.shield(child.wait())
+        finally:
+            ACTIVE_CHILDREN.discard(child.pid)
+            operation_temp.cleanup()
 
 
 def bounded_reply(name, reply):

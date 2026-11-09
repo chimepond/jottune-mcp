@@ -5,16 +5,17 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync,spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {resolveSDK,packageRoot} from '../lib/sdk.mjs';
-import {isSDKFile,stagePackage} from '../scripts/package.mjs';
+import {isSDKFile} from '../scripts/package.mjs';
 
 async function fixture(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'jottune-mcp-test-')));
   t.after(()=>fs.rm(root,{recursive:true,force:true}));
   const sdk=path.join(root,'jottune-synth');await fs.mkdir(sdk);
-  for(const file of ['LICENSE','Makefile','tools/fm.py','tools/interchange.py','tools/export_schema.py','docs/INSTRUMENT.md','src/host/harness.c']) {
+  for(const file of ['LICENSE','Makefile','tools/fm.py','tools/interchange.py','tools/export_schema.py','tools/decode.py',
+    'docs/INSTRUMENT.md','docs/DECODING.md','src/host/harness.c']) {
     await fs.mkdir(path.dirname(path.join(sdk,file)),{recursive:true});
     await fs.writeFile(path.join(sdk,file),'fixture\n');
   }
@@ -149,7 +150,8 @@ test('build without a C compiler explains how to install one and leaves no build
   await assert.rejects(fs.lstat(path.join(sdk,'build')),{code:'ENOENT'});
 });
 test('package selection excludes corpora, apps, infrastructure and experiments',()=>{
-  for(const file of ['src/host/harness.c','tools/fm.py','tools/export_schema.py','tools/music/compose.py','data/recipes.txt','web/media.mjs'])
+  for(const file of ['src/host/harness.c','tools/fm.py','tools/export_schema.py','tools/decode.py','docs/DECODING.md',
+    'tools/music/compose.py','data/recipes.txt','web/media.mjs'])
     assert.equal(isSDKFile(file),true,file);
   for(const file of ['music/song.tl','tests/golden/sine.tl','data/catalog.tsv','apps/macos/App.swift',
     'site/exchange.mjs','audio-text-lab/cli.mjs','tools/music/songbook/song.py','swarm/notes.md'])
@@ -160,10 +162,24 @@ test('package staging pins committed source and rejects dirty or existing output
   const git=args=>execFileSync('git',args,{cwd:sdk,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
   git(['init','--initial-branch=main']);git(['add','--','LICENSE','Makefile','tools','docs','src']);
   git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','Create fixture']);
+  // Exercise packaging from its own committed checkout, including ignored files
+  // and dirty source, rather than depending on the caller's working-tree state.
+  const mcp=path.join(root,'jottune-mcp');await fs.mkdir(mcp);
+  const sourceMembers=['LICENSE','SECURITY.md','README.md','CHANGELOG.md','package.json','bin','lib','server','requirements','scripts'];
+  for(const member of sourceMembers)await fs.cp(path.join(packageRoot,member),path.join(mcp,member),
+    {recursive:true,filter:file=>!file.split(path.sep).includes('__pycache__')&&!file.endsWith('.pyc')});
+  const mcpGit=args=>execFileSync('git',args,{cwd:mcp,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+  mcpGit(['init','--initial-branch=main']);mcpGit(['add','--',...sourceMembers]);
+  mcpGit(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','Create package fixture']);
+  const {stagePackage}=await import(pathToFileURL(path.join(mcp,'scripts/package.mjs')));
+  await fs.writeFile(path.join(mcp,'.git/info/exclude'),'server/ignored-local.py\n');
+  await fs.writeFile(path.join(mcp,'server/ignored-local.py'),'must not ship\n');
   const output=path.join(root,'package'),result=await stagePackage({synthRoot:sdk,output});
   const revision=JSON.parse(await fs.readFile(path.join(output,'synth-release.json'),'utf8'));
   assert.equal(result.synth_revision,git(['rev-parse','HEAD']));
   assert.equal(revision.source_revision,result.synth_revision);
+  assert.equal(result.mcp_revision,mcpGit(['rev-parse','HEAD']));
+  assert.equal(revision.mcp_source_revision,result.mcp_revision);
   const manifest=JSON.parse(await fs.readFile(path.join(output,'package.json'),'utf8'));
   const sourceManifest=JSON.parse(await fs.readFile(path.join(packageRoot,'package.json'),'utf8'));
   assert.equal(sourceManifest.private,true,'The unassembled source checkout must refuse npm publication');
@@ -183,9 +199,16 @@ test('package staging pins committed source and rejects dirty or existing output
   const names=packed.files.map(file=>file.path);
   assert.ok(names.includes('server/mcp_server.py')&&names.includes('synth/src/host/harness.c'));
   assert.ok(names.includes('synth/tools/export_schema.py'));
+  assert.ok(names.includes('synth/tools/decode.py')&&names.includes('synth/docs/DECODING.md'));
+  assert.ok(!names.includes('server/ignored-local.py'));
   assert.ok(!names.some(name=>name.includes('__pycache__')||name.endsWith('.pyc')||name.endsWith('.tl')||
     name.startsWith('synth/build/')||name==='synth/data/catalog.tsv'));
   await assert.rejects(stagePackage({synthRoot:sdk,output}),/already exists/);
+  const readme=await fs.readFile(path.join(mcp,'README.md'));
+  await fs.appendFile(path.join(mcp,'README.md'),'uncommitted change\n');
+  await assert.rejects(stagePackage({synthRoot:sdk,output:path.join(root,'dirty-mcp')}),/Commit the MCP source/);
+  await assert.rejects(fs.access(path.join(root,'dirty-mcp')),{code:'ENOENT'});
+  await fs.writeFile(path.join(mcp,'README.md'),readme);
   await fs.writeFile(path.join(sdk,'tools/fm.py'),'changed\n');
   await assert.rejects(stagePackage({synthRoot:sdk,output:path.join(root,'dirty')}),/Commit the synth SDK/);
 });
