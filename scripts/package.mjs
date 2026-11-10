@@ -9,12 +9,12 @@ import {fileURLToPath} from 'node:url';
 import {packageRoot, resolveSDK} from '../lib/sdk.mjs';
 
 const sdkFiles = new Set([
-  'LICENSE', 'NOTICE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md', 'docs/DECODING.md',
+  'LICENSE', 'NOTICE', 'Makefile', 'docs/INSTRUMENT.md', 'docs/INTERCHANGE.md', 'docs/DECODING.md', 'docs/TL-FORMAT.md',
   'tools/fm.py', 'tools/score.py', 'tools/generator.py', 'tools/measure.py',
   'tools/midi_export.py', 'tools/sample_export.py', 'tools/interchange.py',
-  'tools/export_schema.py', 'tools/decode.py',
+  'tools/export_schema.py', 'tools/decode.py', 'tools/tl_document.py',
   'tools/catalog.py', 'tools/receipts.py', 'tools/session.py', 'tools/recover.py',
-  'tools/tl_svg.mjs', 'web/media.mjs', 'web/runtime.mjs',
+  'tools/tl_svg.mjs', 'web/media.mjs', 'web/runtime.mjs', 'web/tl-document.mjs',
 ]);
 
 export function isSDKFile(name) {

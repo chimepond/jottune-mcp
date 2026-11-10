@@ -251,3 +251,17 @@ test('config and doctor look up Python modules as the server does, not in the ca
   assert.equal(typeof doctor.python_version,'string');
   for(const name of ['json','mcp']) await assert.rejects(fs.access(path.join(root,name+'-was-imported')),name+' was imported from the caller\'s directory');
 });
+
+
+test('doctor refuses an SDK/native portable format mismatch before calling it ready',async t=>{
+  const {root,sdk}=await fixture(t),workspace=path.join(root,'portable-session');await fs.mkdir(workspace);
+  await fs.writeFile(path.join(sdk,'tools/fm.py'),"API_VERSION = 1\nclass Native:\n    def __init__(self, harness):\n        self.metadata = type('Metadata', (), {'engine': 'fixture engine'})()\n");
+  await fs.writeFile(path.join(sdk,'tools/tl_document.py'),'TL_VERSION = ENGINE_VERSION = 1\n');
+  const harness=path.join(sdk,'build/s12e10p1v1/harness');await fs.mkdir(path.dirname(harness),{recursive:true});
+  for(const version of [1,2]){
+    await fs.writeFile(harness,'#!/bin/sh\nprintf "TL_FORMAT tl_version='+version+' engine_version=1\\n"\n',{mode:0o700});await fs.chmod(harness,0o700);
+    const response=spawnSync(process.execPath,[launcher,'doctor','--synth-root',sdk,'--workspace',workspace],{encoding:'utf8'});
+    const value=JSON.parse(response.stdout);assert.equal(value.tl_format.compatible,version===1);assert.equal(value.tl_format.native.tl_version,version);
+    if(version===2){assert.equal(value.ok,false);assert.match(value.tl_format.error,/rebuild|matching harness/);}
+  }
+});

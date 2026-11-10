@@ -104,6 +104,7 @@ async def check(spec, workspace, harness, launcher, env):
         guide = await call(client, "reference", {"section": "Musical-time scores", "length": 8192})
         score = json.loads(re.search(r"```json\s*(.*?)\s*```", guide["text"], re.S).group(1))
         score["name"] = "MCP integration"
+        score["metadata"] = {"title":"Portable MCP integration","made_by":"agent","model":{"id":"fixture/v1","source":"client-reported"}}
         first = await call(client, "compose", {"score": score, "log": "takes", "receipt_dir": "operations"})
         assert first["published"] and first["receipt"]["state"] == "complete"
         source = {"directory": "operations", **first["receipt"]["source_artifact"]}
@@ -118,6 +119,9 @@ async def check(spec, workspace, harness, launcher, env):
                             "receipt_dir": "operations", "parent_record": first["record_sha256"]})
         assert second["record_sha256"] != first["record_sha256"]
         canonical = await retrieve(client, second["artifact"], text=True)
+        assert canonical.startswith(b"# jottune-tl 1 1\n") and b"Portable MCP integration" in canonical
+        assert second["document_sha256"] == hashlib.sha256(canonical).hexdigest()
+        assert second["record_sha256"] != second["document_sha256"]
         rendered = await call(client, "render", {"text": canonical.decode("utf8"), "log": "audio",
                               "wav": True, "detail": "compact"})
         assert rendered["checks_pass"] and rendered["record_sha256"] == second["record_sha256"]

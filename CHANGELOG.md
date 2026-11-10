@@ -2,6 +2,8 @@
 
 ## 0.1.0 — unpublished beta candidate
 
+- Bundle portable TL document validation and report TL/engine compatibility versions in doctor.
+
 - Complete child reaping, active-worker removal and temporary-directory cleanup
   before returning from an AnyIO-cancelled tool call.
 - Package only tracked files from clean MCP and synth checkouts, record both

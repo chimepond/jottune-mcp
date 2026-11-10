@@ -72,7 +72,7 @@ const probeScript = `import sys
 # own directory there instead, so the probe finds modules the way the server will.
 if sys.path and sys.path[0] == '':
     sys.path[0] = sys.argv[4]
-import importlib, importlib.util, json
+import importlib, importlib.util, json, os, re, subprocess
 mode, fm_path, harness, server, root = sys.argv[1:6]
 modules = {}
 for name in ('mcp.server',) if mode == 'config' else ('mcp.server', 'mcp.client', 'numpy', 'matplotlib'):
@@ -117,6 +117,21 @@ if mode == 'doctor':
             report['native'] = {'ok': True, 'engine': renderer.metadata.engine}
         except Exception as error:
             report['native'] = {'ok': False, 'error': str(error)}
+    try:
+        document_spec = importlib.util.spec_from_file_location('jottune_document_format', os.path.join(root, 'tools', 'tl_document.py'))
+        document_module = importlib.util.module_from_spec(document_spec)
+        document_spec.loader.exec_module(document_module)
+        report['tl_format'] = {'tl_version': document_module.TL_VERSION, 'engine_version': document_module.ENGINE_VERSION, 'compatible': False}
+        native_format = subprocess.run([harness, '--tl-format'], capture_output=True, text=True, timeout=5)
+        match = re.fullmatch(r'TL_FORMAT tl_version=([1-9][0-9]*) engine_version=([1-9][0-9]*)', native_format.stdout.strip())
+        if native_format.returncode or native_format.stderr.strip() or not match:
+            raise ValueError('Selected native build does not report the required TL format contract; rebuild or select the matching harness.')
+        report['tl_format']['native'] = {'tl_version': int(match[1]), 'engine_version': int(match[2])}
+        if report['tl_format']['native'] != {'tl_version': document_module.TL_VERSION, 'engine_version': document_module.ENGINE_VERSION}:
+            raise ValueError('Selected native TL/engine compatibility versions differ from the SDK; rebuild or select the matching harness.')
+        report['tl_format']['compatible'] = True
+    except Exception as error:
+        report.setdefault('tl_format', {}).update(compatible=False, error=str(error))
     try:
         import mcp_server
         report['server'] = {'ok': True, 'tools': len(mcp_server.create_server(harness, synth_root=root).operation_functions)}
@@ -217,11 +232,11 @@ Installation never downloads or compiles an engine. No command publishes music.`
     const capabilities = {mcp: available('mcp.server') && available('mcp.client'),
       render: engine, analysis: available('numpy'), plots: available('numpy') && available('matplotlib')};
     // The server does not check the synth API itself, so ok includes it (synth_api says why).
-    const ok = capabilities.mcp && capabilities.render && details.api?.compatible === true && details.server?.ok === true;
+    const ok = capabilities.mcp && capabilities.render && details.tl_format?.compatible === true && details.api?.compatible === true && details.server?.ok === true;
     console.log(JSON.stringify({ok, complete: ok && capabilities.analysis && capabilities.plots, capabilities,
       python, python_version: details.version || null, dependencies: details.modules || {},
       harness, engine: engine ? 'ENGINE ' + details.native.engine : null, root, workspace,
-      synth_revision: synthRevision(), synth_api: details.api || null, tools: details.server?.tools ?? null,
+      synth_revision: synthRevision(), tl_format: details.tl_format || null, synth_api: details.api || null, tools: details.server?.tools ?? null,
       server_error: details.server?.error || null, requirements,
       requirements_profiles: requirementProfiles,
       install: installFor(requirements),

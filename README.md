@@ -210,3 +210,14 @@ The prepared GitHub workflow checks the launcher on Linux and macOS. Its native
 integration job requires repository variable `JOTTUNE_SYNTH_REF` set to the full
 public SDK commit ID. That job is skipped until configured; launcher checks alone
 do not establish SDK integration. Hosted CI has not been run for this candidate.
+
+## Portable TL documents
+
+The bundled SDK preserves an optional bounded metadata header through song
+authoring, rendering and export. Score inputs accept an explicit `metadata`
+object; no model attribution or licence is inferred. Existing headerless TL
+files remain valid. The song key hashes canonical music only, while
+`document_sha256` identifies complete file bytes. `doctor` reports supported
+`tl_format` and engine compatibility counters. Unsupported newer requirements
+are refused. Publication consent and removal credentials are never supplied by
+the metadata header. See the bundled `synth/docs/TL-FORMAT.md`.
