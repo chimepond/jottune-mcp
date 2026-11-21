@@ -3,7 +3,7 @@
 
 # Security and rights contact
 
-Send private security reports to chimepond@nmic.app. Include the affected
+Send private security reports to support@chimepond.com. Include the affected
 version, impact and minimal reproduction; do not include real credentials or
 private songs. Avoid posting unpatched vulnerabilities or secrets in public
 issues. GitHub private vulnerability reporting can also be used when enabled

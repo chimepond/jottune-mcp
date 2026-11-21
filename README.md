@@ -203,6 +203,9 @@ Code is licensed under Apache-2.0. Bundled synth dependencies retain their
 upstream licences and notices, including the synth NOTICE for adapted tables.
 For security reports, rights questions or takedown requests, see SECURITY.md.
 
+For help with the music tools, email [ChimePond support](mailto:support@chimepond.com).
+To discuss the project with Nenad Micic, email [chimepond@nmic.app](mailto:chimepond@nmic.app).
+
 The prepared GitHub workflow checks the launcher on Linux and macOS. Its native
 integration job requires repository variable `JOTTUNE_SYNTH_REF` set to the full
 public SDK commit ID. Check that the integration job passed on the release commit
