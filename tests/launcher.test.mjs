@@ -15,7 +15,7 @@ async function fixture(t) {
   t.after(()=>fs.rm(root,{recursive:true,force:true}));
   const sdk=path.join(root,'jottune-synth');await fs.mkdir(sdk);
   for(const file of ['LICENSE','Makefile','tools/fm.py','tools/interchange.py','tools/export_schema.py','tools/decode.py',
-    'docs/INSTRUMENT.md','docs/DECODING.md','src/host/harness.c']) {
+    'docs/INSTRUMENT.md','docs/DECODING.md','src/host/harness.c','web/tl-document.mjs']) {
     await fs.mkdir(path.dirname(path.join(sdk,file)),{recursive:true});
     await fs.writeFile(path.join(sdk,file),'fixture\n');
   }
@@ -160,7 +160,7 @@ test('package selection excludes corpora, apps, infrastructure and experiments',
 test('package staging pins committed source and rejects dirty or existing output',async t=>{
   const {root,sdk}=await fixture(t);
   const git=args=>execFileSync('git',args,{cwd:sdk,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
-  git(['init','--initial-branch=main']);git(['add','--','LICENSE','Makefile','tools','docs','src']);
+  git(['init','--initial-branch=main']);git(['add','--','LICENSE','Makefile','tools','docs','src','web']);
   git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','Create fixture']);
   // Exercise packaging from its own committed checkout, including ignored files
   // and dirty source, rather than depending on the caller's working-tree state.
@@ -197,6 +197,7 @@ test('package staging pins committed source and rejects dirty or existing output
     env:{...process.env,npm_config_cache:path.join(root,'npm-cache')},
   }))[0];
   const names=packed.files.map(file=>file.path);
+  assert.ok(names.includes('synth/web/tl-document.mjs'));
   assert.ok(names.includes('server/mcp_server.py')&&names.includes('synth/src/host/harness.c'));
   assert.ok(names.includes('synth/tools/export_schema.py'));
   assert.ok(names.includes('synth/tools/decode.py')&&names.includes('synth/docs/DECODING.md'));

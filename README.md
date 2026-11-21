@@ -8,9 +8,8 @@ SVG/PNG visualizations, MIDI/SFZ conversion and portable session recovery.
 Music remains in the workspace you select. No account, hosted model or API key
 is required; the server has no song-publication operation.
 
-Version 0.1.0 is an unpublished public beta candidate for
-`@chimepond/jottune-mcp`. Preparing or installing a local archive does not
-publish it to npm.
+The npm package name is `@chimepond/jottune-mcp`. The 0.1.0 beta includes the
+synth SDK. You can also run the server from sibling source checkouts.
 
 ## Related repositories
 
@@ -20,8 +19,6 @@ publish it to npm.
   collection.
 - [ChimePond](https://chimepond.com) is the separately operated sharing platform.
   This server has no publication operation.
-
-Repository links become available when the public beta is published.
 
 ## Requirements
 
@@ -208,8 +205,8 @@ For security reports, rights questions or takedown requests, see SECURITY.md.
 
 The prepared GitHub workflow checks the launcher on Linux and macOS. Its native
 integration job requires repository variable `JOTTUNE_SYNTH_REF` set to the full
-public SDK commit ID. That job is skipped until configured; launcher checks alone
-do not establish SDK integration. Hosted CI has not been run for this candidate.
+public SDK commit ID. Check that the integration job passed on the release commit
+before publishing the archive. Without this variable only the launcher job runs.
 
 ## Portable TL documents
 

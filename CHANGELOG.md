@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.1.0 — unpublished beta candidate
+## 0.1.0 beta
 
-- Bundle portable TL document validation and report TL/engine compatibility versions in doctor.
+- Include the Python and JavaScript TL document validators in the npm archive.
+  Report the supported TL and engine versions in `doctor`.
 
 - Complete child reaping, active-worker removal and temporary-directory cleanup
   before returning from an AnyIO-cancelled tool call.
