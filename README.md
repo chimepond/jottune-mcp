@@ -15,8 +15,8 @@ synth SDK. You can also run the server from sibling source checkouts.
 
 - [JotTune Synth](https://github.com/chimepond/jottune-synth) is the renderer,
   the TL format and the SDK that this server runs. Its README has the project map.
-- [Tunes](https://github.com/chimepond/tunes) is the separate readable song
-  collection.
+- The [synth examples](https://github.com/chimepond/jottune-synth/tree/main/examples)
+  include complete songs you can play locally.
 - [ChimePond](https://chimepond.com) is the separately operated sharing platform.
   This server has no publication operation.
 
