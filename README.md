@@ -8,8 +8,45 @@ SVG/PNG visualizations, MIDI/SFZ conversion and portable session recovery.
 Music remains in the workspace you select. No account, hosted model or API key
 is required; the server has no song-publication operation.
 
-The npm package name is `@chimepond/jottune-mcp`. The 0.1.0 beta includes the
-synth SDK. You can also run the server from sibling source checkouts.
+## Install from npm
+
+On macOS or Linux, use Node.js 22 or later, Python 3.10 or later, Make and a
+C99 compiler. On Debian or Ubuntu, install `python3-venv` for the system Python
+so that the virtual environment includes pip. The npm package includes the synth SDK.
+[Package on npm](https://www.npmjs.com/package/@chimepond/jottune-mcp)
+
+```sh
+npm install -g @chimepond/jottune-mcp
+```
+
+The first public beta is `0.1.0`. Use `@chimepond/jottune-mcp@0.1.0` to pin
+that release or `@chimepond/jottune-mcp@beta` to follow the beta channel.
+
+From a directory where you keep projects, create a song workspace, install the
+Python dependencies and build the renderer. Choose an npm installation location
+your account can write to, since the build writes into the bundled SDK.
+
+```sh
+mkdir -p jottune-session/songs
+cd jottune-session
+python3 -m venv .venv
+export JOTTUNE_PYTHON="$PWD/.venv/bin/python"
+"$JOTTUNE_PYTHON" -m pip install -r "$(jottune-mcp requirements)"
+jottune-mcp build
+jottune-mcp doctor --workspace songs
+jottune-mcp config --workspace songs
+```
+
+For a working core installation, `doctor` reports `"ok": true`. Copy the
+`jottune` entry from the printed `mcpServers` configuration into your MCP
+client’s local stdio settings and reconnect. For clients with another settings format, use the printed command,
+arguments and environment. The integration tests use the Python MCP client.
+Try asking your connected agent to compose a short piece and return its editable
+TL file and rendered WAV.
+
+In a new shell, set `JOTTUNE_PYTHON` to the same virtual environment before
+running `doctor` or `config`. After upgrading the JotTune package, rerun
+`jottune-mcp build` and `jottune-mcp doctor --workspace songs` from the session directory.
 
 ## Related repositories
 
@@ -23,10 +60,8 @@ synth SDK. You can also run the server from sibling source checkouts.
 
 ## Requirements
 
-For normal setup, use Node.js 24 and Python 3.12 or later. The compatible minimum
-families are Node.js 22 and Python 3.10. A JotTune Synth SDK checkout or a package
-containing one is required. The native renderer needs Make and a C99 compiler.
-An existing compatible renderer can instead be supplied with `--harness`.
+For normal setup, use Node.js 24 and Python 3.12 or later. You can select an
+existing compatible native renderer with `--harness PATH`.
 
 The package installation and core composition/delivery workflow have been checked on macOS
 with Node 25.8.2/Python 3.14.7 and Linux x86-64 with Node 24.22.1/Python 3.12.3.
@@ -38,6 +73,8 @@ delivery, exports and session recovery.
 The Node launcher has no npm runtime dependencies. The Python MCP SDK has
 transitive dependencies. NumPy and Matplotlib are optional, explicitly installed
 capabilities; no install hook compiles or downloads an engine.
+
+## Run from a source checkout
 
 For source development, place `jottune-mcp` and `jottune-synth` beside one another,
 or select the SDK with `JOTTUNE_SYNTH_ROOT` or `--synth-root PATH`. An explicit
@@ -57,37 +94,9 @@ node bin/jottune-mcp.mjs doctor --workspace session
 node bin/jottune-mcp.mjs config --workspace session
 ```
 
-Copy the printed configuration into your MCP client's local stdio-server settings.
-Configuration layouts differ by client; this prints the conventional mcpServers
-entry, not a claim that every client accepts that file format unchanged. The
-protocol workflow is tested through the Python MCP client; individual desktop
-clients require their own configuration and acceptance check.
+Copy the printed server entry into your client's local stdio settings and reconnect.
 
-Copy the printed configuration into your MCP client. It contains absolute
-launcher, SDK, Python and workspace paths. Configuration generation does not
-edit client files. Reconnect the client after changing its configuration.
-
-For an installed npm package, use the `jottune-mcp` command from that
-installation instead of `node bin/jottune-mcp.mjs`. Keep the Python virtual
-environment outside the installed package and locate its requirements through
-the command, rather than assuming a source-checkout layout:
-
-```sh
-python3 -c 'import sys; assert sys.version_info >= (3, 10), "Use Python 3.10 or later"'
-python3 -m venv ~/.local/share/jottune-mcp/venv
-export JOTTUNE_PYTHON="$HOME/.local/share/jottune-mcp/venv/bin/python"
-"$JOTTUNE_PYTHON" -m pip install -r "$(jottune-mcp requirements)"
-mkdir -p session
-jottune-mcp build
-jottune-mcp doctor --workspace session
-jottune-mcp config --workspace session
-```
-
-The explicit build writes into the selected SDK, so that directory must be
-writable. A separately built renderer can instead be selected with `--harness`.
-Reinstalling or updating the npm package replaces its bundled SDK and removes
-that local build; run `jottune-mcp build` and `doctor` again before reconnecting.
-A separately managed SDK/harness stays under your control.
+## Workspace and execution
 
 `--workspace` is the boundary for tool-selected inputs, outputs and artifact
 reads, including resolved symlink targets. Copy files into that directory before
@@ -157,10 +166,14 @@ bundled in the npm package.
 
 ## Optional analysis and plots
 
+To add analysis and PNG plots to the npm setup, run this in the same shell.
+
 ```sh
-.venv/bin/python -m pip install -r requirements/analysis.txt
-.venv/bin/python -m pip install -r requirements/plots.txt
+"$JOTTUNE_PYTHON" -m pip install -r "$(jottune-mcp requirements --plots)"
 ```
+
+Use `--analysis` for NumPy alone. In a source checkout, pass
+`requirements/analysis.txt` or `requirements/plots.txt` to the same Python interpreter.
 
 Analysis enables measured audio analysis and descriptor search. Plots adds PNG
 spectrograms. Core composition, revision, rendering, recipes, SVG and session
@@ -169,7 +182,8 @@ from a complete optional environment. All tool schemas remain discoverable;
 operations needing an absent optional dependency return a clear refusal.
 
 The launcher also exposes `guide`, `svg` and `interchange` commands. Run
-`node bin/jottune-mcp.mjs --help` for usage.
+`jottune-mcp --help` in an npm installation or `node bin/jottune-mcp.mjs --help`
+in a source checkout.
 
 ## Package and test
 
