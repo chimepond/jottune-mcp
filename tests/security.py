@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT.parent / "jottune-synth"
+SMALL_TL = SDK / "examples" / "sine.tl"
 sys.path.insert(0, str(ROOT / "server"))
 from guard import Workspace, WorkspaceError
 
@@ -247,7 +248,7 @@ class WorkspaceTests(unittest.TestCase):
                     " time.sleep(60)\n" +
                     "else: os.execv(" + repr(str(native)) + ", [" + repr(str(native)) + "]+sys.argv[1:])\n")
                 fake.chmod(0o700)
-                text = next((SDK / "examples").glob("*.tl")).read_text()
+                text = SMALL_TL.read_text()
                 task = asyncio.create_task(isolated_tool("render", {"text": text, "out": "result"}, fake, SDK, root))
                 marker = root / "running.json"
                 for _ in range(300):
@@ -289,7 +290,7 @@ class WorkspaceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 fake = self.slow_harness(root)
-                text = next((SDK / "examples").glob("*.tl")).read_text()
+                text = SMALL_TL.read_text()
                 scopes = []
 
                 async def call():
@@ -355,7 +356,7 @@ class WorkspaceTests(unittest.TestCase):
                 dying = root / "dying-harness"
                 dying.write_text(fake.read_text().replace("time.sleep(60)", "os.kill(os.getppid(),9)"))
                 dying.chmod(0o700)
-                text = next((SDK / "examples").glob("*.tl")).read_text()
+                text = SMALL_TL.read_text()
                 died = await isolated_tool("render", {"text": text, "out": "new"}, dying, SDK, root)
                 self.assertEqual((died["ok"], died["exit"]), (False, 5), died)
                 self.assertIn("without a structured result", died["message"])
@@ -369,7 +370,7 @@ class WorkspaceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 fake = self.slow_harness(root)
-                text = next((SDK / "examples").glob("*.tl")).read_text()
+                text = SMALL_TL.read_text()
                 with patch.object(mcp_server, "TOOL_SECONDS", 3):
                     reply = await isolated_tool("render", {"text": text, "out": "new"}, fake, SDK, root)
                 self.assertEqual((reply["ok"], reply["exit"]), (False, 5), reply)
@@ -418,7 +419,7 @@ class WorkspaceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 fake = self.slow_harness(root)
-                text = next((SDK / "examples").glob("*.tl")).read_text()
+                text = SMALL_TL.read_text()
                 first = asyncio.create_task(isolated_tool("render", {"text": text, "out": "one"}, fake, SDK, root))
                 for _ in range(300):
                     if list(root.glob("running-*")):
@@ -466,7 +467,7 @@ class WorkspaceTests(unittest.TestCase):
                     self.assertIn("result", json.loads(await asyncio.wait_for(server.stdout.readline(), 10)))
                     await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
                     await send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "render",
-                        "arguments": {"text": next((SDK / "examples").glob("*.tl")).read_text(), "out": "new"}}})
+                        "arguments": {"text": SMALL_TL.read_text(), "out": "new"}}})
                     for _ in range(500):
                         markers = list(root.glob("running-*"))
                         if markers:
@@ -623,7 +624,7 @@ class WorkspaceTests(unittest.TestCase):
                     self.assertIn("result",answer)
                     await send({"jsonrpc":"2.0","method":"notifications/initialized"})
                     await send({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"render",
-                        "arguments":{"text":next((SDK/'examples').glob('*.tl')).read_text(),"out":"new"}}})
+                        "arguments":{"text":SMALL_TL.read_text(),"out":"new"}}})
                     marker=root/'running.pid'
                     for _ in range(300):
                         if marker.exists():break
